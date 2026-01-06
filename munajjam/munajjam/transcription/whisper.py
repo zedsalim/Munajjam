@@ -444,6 +444,39 @@ class WhisperTranscriber(BaseTranscriber):
                 except (PermissionError, OSError):
                     pass  # Ignore cleanup errors on Windows
 
+    def transcribe_segment(self, audio_path: str | Path) -> str:
+        """
+        Transcribe a single audio file and return the combined text.
+        
+        This is a simplified interface for reprocessing where we just
+        need the text, not the full segment information.
+        
+        Args:
+            audio_path: Path to the audio file
+        
+        Returns:
+            Transcribed text as a single string
+        """
+        if not self.is_loaded:
+            raise ModelNotLoadedError()
+        
+        audio_path = Path(audio_path)
+        if not audio_path.exists():
+            raise AudioFileError(str(audio_path), "File not found")
+        
+        # Load audio waveform
+        waveform, sr = load_audio_waveform(
+            audio_path,
+            sample_rate=self._settings.sample_rate,
+        )
+        
+        if len(waveform) == 0:
+            return ""
+        
+        # Transcribe the whole file as one segment
+        text = self._transcribe_segment(waveform, sr)
+        return text.strip()
+
     async def transcribe_async(self, audio_path: str | Path) -> list[Segment]:
         """
         Asynchronously transcribe an audio file.

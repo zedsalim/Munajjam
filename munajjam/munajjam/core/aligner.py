@@ -418,4 +418,3 @@ def get_alignment_stats(ctx: AlignmentContext) -> dict:
         "avg_similarity": sum(similarities) / len(similarities),
         "min_similarity": min(similarities),
     }
-

@@ -24,6 +24,19 @@ from munajjam.core.overlap import (
     convert_silences_to_seconds,
 )
 from munajjam.core.aligner import align_segments, AlignmentContext, get_alignment_stats
+from munajjam.core.aligner_dp import (
+    align_segments_dp_with_constraints,
+    align_segments_hybrid,
+    HybridStats,
+)
+from munajjam.core.zone_realigner import (
+    realign_problem_zones,
+    identify_problem_zones,
+    realign_from_anchors,
+    fix_overlaps,
+    ProblemZone,
+    ZoneStats,
+)
 
 __all__ = [
     # Arabic
@@ -41,9 +54,21 @@ __all__ = [
     "apply_buffers",
     "find_silence_gap_between",
     "convert_silences_to_seconds",
-    # Aligner
+    # Aligner (old/greedy)
     "align_segments",
     "AlignmentContext",
     "get_alignment_stats",
+    # Aligner (DP)
+    "align_segments_dp_with_constraints",
+    # Aligner (Hybrid)
+    "align_segments_hybrid",
+    "HybridStats",
+    # Zone Realigner (drift fix)
+    "realign_problem_zones",
+    "identify_problem_zones",
+    "realign_from_anchors",
+    "fix_overlaps",
+    "ProblemZone",
+    "ZoneStats",
 ]
 
