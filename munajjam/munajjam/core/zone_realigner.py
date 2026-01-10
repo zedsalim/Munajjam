@@ -1,10 +1,36 @@
 """
 Zone Re-alignment Module
 
-Fixes drift issues in long surahs by:
-1. Identifying "problem zones" - consecutive low-confidence ayahs
-2. Re-aligning just those zones using segments in the time range
-3. Keeping the better result for each ayah
+Fixes drift issues in long surahs by identifying and re-aligning problematic regions.
+
+WHAT IS DRIFT?
+--------------
+In long surahs (especially 30+ minutes), timing can gradually drift away from
+the true alignment. This happens because:
+1. Small errors accumulate over time
+2. The reciter's pace may change throughout the recording
+3. Pauses and emphasis patterns vary
+
+Example of drift:
+- Ayahs 1-50: Good alignment (similarity ~0.95)
+- Ayahs 51-75: Drift begins (similarity drops to ~0.75)
+- Ayahs 76-100: Severe drift (similarity ~0.60)
+- Ayahs 101-120: Good again after a natural break
+
+SOLUTION: ZONE RE-ALIGNMENT
+---------------------------
+Instead of re-aligning the entire surah (expensive), we:
+1. Identify "problem zones" - consecutive low-confidence ayahs
+2. Re-align ONLY those zones using segments in their time range
+3. Keep the better result for each ayah (old vs. new)
+
+This is much faster and preserves good alignments while fixing drift.
+
+TWO STRATEGIES:
+--------------
+1. Problem Zone Re-alignment: Fixes obvious low-confidence regions
+2. Anchor-based Re-alignment: Uses high-confidence ayahs as anchors
+   and re-aligns the gaps between them
 """
 
 from dataclasses import dataclass
@@ -40,32 +66,57 @@ def identify_problem_zones(
     quality_threshold: float = 0.85,
 ) -> list[ProblemZone]:
     """
-    Find sequences of consecutive low-confidence ayahs.
-    
+    Find sequences of consecutive low-confidence ayahs (drift zones).
+
+    A "problem zone" is a region where alignment quality has degraded,
+    typically due to timing drift in long recordings.
+
+    Example scenario:
+    ```
+    Ayah 48: similarity 0.92 ✓
+    Ayah 49: similarity 0.88 ✓
+    Ayah 50: similarity 0.78 ← START OF ZONE
+    Ayah 51: similarity 0.75 ← IN ZONE
+    Ayah 52: similarity 0.72 ← IN ZONE
+    Ayah 53: similarity 0.90 ✓ ← END OF ZONE
+    ```
+
+    If min_consecutive=3 and quality_threshold=0.85, ayahs 50-52 form a zone.
+
     Args:
-        results: List of alignment results
-        min_consecutive: Minimum consecutive low-conf ayahs to form a zone
-        quality_threshold: Similarity threshold below which is "low confidence"
-    
+        results: List of alignment results (in order)
+        min_consecutive: Minimum consecutive low-confidence ayahs to form a zone.
+                        Default 3 prevents single outliers from triggering re-alignment.
+        quality_threshold: Similarity below which an ayah is "low confidence".
+                          Default 0.85 means 85% similarity is the cutoff.
+
     Returns:
-        List of ProblemZone objects
+        List of ProblemZone objects, each containing:
+        - start_idx, end_idx: Slice indices in results list
+        - start_ayah, end_ayah: Ayah numbers
+        - avg_similarity: Average similarity in the zone
+        - start_time, end_time: Time boundaries for re-alignment
     """
     zones = []
-    current_zone_start = None
-    current_zone_sims = []
-    
+    current_zone_start = None  # Index where current zone started
+    current_zone_sims = []     # Similarity scores in current zone
+
     for i, result in enumerate(results):
         is_low = result.similarity_score < quality_threshold
-        
+
         if is_low:
+            # This ayah is low-confidence
             if current_zone_start is None:
+                # Start a new zone
                 current_zone_start = i
                 current_zone_sims = [result.similarity_score]
             else:
+                # Continue existing zone
                 current_zone_sims.append(result.similarity_score)
         else:
-            # End of potential zone
+            # This ayah is high-confidence - potential end of zone
             if current_zone_start is not None and len(current_zone_sims) >= min_consecutive:
+                # We have a valid zone (enough consecutive low-conf ayahs)
                 zone_results = results[current_zone_start:i]
                 zones.append(ProblemZone(
                     start_idx=current_zone_start,
@@ -76,10 +127,11 @@ def identify_problem_zones(
                     start_time=zone_results[0].start_time,
                     end_time=zone_results[-1].end_time,
                 ))
+            # Reset zone tracking
             current_zone_start = None
             current_zone_sims = []
-    
-    # Handle zone at the end
+
+    # Handle zone that extends to the end of the surah
     if current_zone_start is not None and len(current_zone_sims) >= min_consecutive:
         zone_results = results[current_zone_start:]
         zones.append(ProblemZone(
@@ -91,7 +143,7 @@ def identify_problem_zones(
             start_time=zone_results[0].start_time,
             end_time=zone_results[-1].end_time,
         ))
-    
+
     return zones
 
 
@@ -154,82 +206,123 @@ def realign_problem_zones(
     buffer_seconds: float = 10.0,
 ) -> tuple[list[AlignmentResult], ZoneStats]:
     """
-    Re-align problem zones in the results.
-    
-    This is the main function to call for drift fix.
-    
+    Re-align problem zones in the results to fix timing drift.
+
+    This is the MAIN ENTRY POINT for zone-based drift correction.
+
+    How it works:
+    1. Scan through results to find "problem zones" (consecutive low-conf ayahs)
+    2. For each zone:
+       a. Extract segments in that time range (with buffer)
+       b. Extract ayahs in that zone
+       c. Re-run DP alignment on just that small region
+       d. Compare old vs new results for each ayah
+       e. Keep whichever result is better
+    3. Return updated results with statistics
+
+    Example:
+    ```
+    Initial results: [0.95, 0.92, 0.78, 0.75, 0.72, 0.91, 0.94]
+                                    ↑____________↑
+                                    Problem zone (ayahs 3-5)
+
+    After re-alignment: [0.95, 0.92, 0.89, 0.87, 0.86, 0.91, 0.94]
+                                         ↑____________↑
+                                         Improved!
+    ```
+
     Args:
-        results: Initial alignment results
-        segments: All segments
-        ayahs: All ayahs
-        min_consecutive: Min consecutive low-conf ayahs to form a zone
-        quality_threshold: Similarity threshold for low confidence
-        buffer_seconds: Extra time at zone boundaries
-    
+        results: Initial alignment results (potentially with drift)
+        segments: All transcribed segments (needed for re-alignment)
+        ayahs: All reference ayahs (needed for re-alignment)
+        min_consecutive: Min consecutive low-conf ayahs to form a zone (default 3)
+        quality_threshold: Similarity below which is "low confidence" (default 0.85)
+        buffer_seconds: Extra time to include at zone boundaries for context (default 10s)
+
     Returns:
-        Tuple of (updated results, statistics)
+        Tuple of:
+        - Updated alignment results (with improved zones)
+        - ZoneStats object with statistics about what was improved
     """
     stats = ZoneStats()
-    
-    # Identify problem zones
+
+    # ============================================================================
+    # STEP 1: Identify Problem Zones
+    # ============================================================================
+    # Scan through all results to find consecutive low-confidence ayahs
     zones = identify_problem_zones(results, min_consecutive, quality_threshold)
     stats.zones_found = len(zones)
-    
+
+    # If no problem zones, return original results unchanged
     if not zones:
         return results, stats
-    
-    # Create a mutable copy of results
+
+    # Create a mutable copy of results (we'll update it in-place)
     new_results = list(results)
-    
-    # Create ayah lookup
+
+    # Create quick lookup table: ayah_number -> Ayah object
     ayah_by_num = {a.ayah_number: a for a in ayahs}
-    
+
+    # ============================================================================
+    # STEP 2: Re-align Each Problem Zone
+    # ============================================================================
     for zone in zones:
-        # Find segments for this zone
+        # --- Extract segments for this zone (with buffer for context) ---
         zone_segments = find_segments_for_zone(segments, zone, buffer_seconds)
-        
+
+        # Safety check: If we don't have enough segments, try a larger buffer
+        # This can happen if the zone boundaries are tight
         if len(zone_segments) < (zone.end_ayah - zone.start_ayah + 1):
-            # Not enough segments, try with larger buffer
             zone_segments = find_segments_for_zone(segments, zone, buffer_seconds * 3)
-        
+
         if not zone_segments:
+            # Still no segments - skip this zone
             continue
-        
-        # Re-align the zone
-        zone_ayahs = [ayah_by_num[n] for n in range(zone.start_ayah, zone.end_ayah + 1) 
+
+        # --- Extract ayahs for this zone ---
+        zone_ayahs = [ayah_by_num[n] for n in range(zone.start_ayah, zone.end_ayah + 1)
                       if n in ayah_by_num]
-        
+
+        # --- Re-run DP alignment on just this small region ---
+        # This is much faster than re-aligning the entire surah
         new_zone_results = align_segments_dp(zone_segments, zone_ayahs)
-        
+
         if not new_zone_results:
+            # Re-alignment failed - skip this zone
             continue
-        
-        # Compare and keep better results
+
+        # ============================================================================
+        # STEP 3: Compare Old vs New Results (Keep Better)
+        # ============================================================================
         zone_improved = False
         new_by_ayah = {r.ayah.ayah_number: r for r in new_zone_results}
-        
+
+        # For each ayah in the zone, compare old vs new
         for i in range(zone.start_idx, zone.end_idx):
             if i >= len(new_results):
                 break
-                
+
             old_result = new_results[i]
             ayah_num = old_result.ayah.ayah_number
-            
+
             if ayah_num in new_by_ayah:
                 new_result = new_by_ayah[ayah_num]
-                
+
+                # Keep whichever result has higher similarity
                 if new_result.similarity_score > old_result.similarity_score:
                     new_results[i] = new_result
                     stats.ayahs_improved += 1
                     zone_improved = True
                 elif new_result.similarity_score < old_result.similarity_score:
+                    # New result is worse - keep old result
                     stats.ayahs_degraded += 1
                 else:
+                    # Same score - keep old result
                     stats.ayahs_unchanged += 1
-        
+
         if zone_improved:
             stats.zones_improved += 1
-    
+
     return new_results, stats
 
 
@@ -240,9 +333,25 @@ def find_anchors(
     max_wps: float = 2.0,
 ) -> list[tuple[int, AlignmentResult]]:
     """
-    Find anchor points - high-confidence ayahs with normal WPS.
-    
-    Returns list of (index, result) tuples.
+    Find anchor points - high-confidence ayahs with normal recitation pace.
+
+    Anchors are ayahs we're very confident about. We use them as reference
+    points and re-align the regions between them.
+
+    What makes a good anchor?
+    1. High similarity (≥95%) - we're confident the timing is correct
+    2. Normal WPS (words per second) - not too fast or too slow
+       - Too fast (>2 WPS): might be compressed/rushed
+       - Too slow (<0.8 WPS): might have pauses or timing issues
+
+    Args:
+        results: List of alignment results
+        min_similarity: Minimum similarity to be an anchor (default 0.95)
+        min_wps: Minimum words per second (default 0.8)
+        max_wps: Maximum words per second (default 2.0)
+
+    Returns:
+        List of (index, result) tuples for anchor points
     """
     anchors = []
     for i, r in enumerate(results):
@@ -264,10 +373,45 @@ def realign_from_anchors(
     buffer_seconds: float = 5.0,
 ) -> tuple[list[AlignmentResult], ZoneStats]:
     """
-    Re-align regions between anchor points.
-    
-    This is more aggressive than zone re-alignment - it uses high-confidence
-    ayahs as anchors and re-aligns everything between them.
+    Re-align regions between anchor points (anchor-based drift correction).
+
+    This is a SECOND PASS after problem zone re-alignment. It's more aggressive
+    and uses a different strategy:
+
+    STRATEGY:
+    1. Find "anchor" ayahs (very high confidence, normal pace)
+    2. Identify gaps between anchors (3+ ayahs)
+    3. Re-align each gap independently
+    4. Keep better results
+
+    Example:
+    ```
+    Ayah 1:  0.97 ← Anchor
+    Ayah 2:  0.82
+    Ayah 3:  0.79  ← Gap (low confidence)
+    Ayah 4:  0.81
+    Ayah 5:  0.96 ← Anchor
+    Ayah 6:  0.75
+    Ayah 7:  0.98 ← Anchor
+    ```
+
+    Gaps identified: [2-4] between anchors 1 and 5
+    We re-align ayahs 2-4 using segments in that time range.
+
+    This complements problem zone re-alignment by:
+    - Using different criteria (anchors vs consecutive low-conf)
+    - Being more targeted (gaps between known-good points)
+    - Catching drift that doesn't form long consecutive zones
+
+    Args:
+        results: Alignment results (ideally after problem zone re-alignment)
+        segments: All transcribed segments
+        ayahs: All reference ayahs
+        min_gap_size: Minimum gap size to re-align (default 3 ayahs)
+        buffer_seconds: Extra time at boundaries (default 5s)
+
+    Returns:
+        Tuple of (updated results, statistics)
     """
     stats = ZoneStats()
     

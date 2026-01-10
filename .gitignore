@@ -53,26 +53,6 @@ cover/
 *.mo
 *.pot
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-.pybuilder/
-target/
-
 # Jupyter Notebook
 .ipynb_checkpoints
 
@@ -95,13 +75,6 @@ poetry.lock
 # PEP 582
 __pypackages__/
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
 # Environments
 .env
 .venv
@@ -111,114 +84,41 @@ ENV/
 env.bak/
 venv.bak/
 
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
 # IDEs
 .vscode/
-.claude/
 .idea/
 *.swp
 *.swo
 *~
-.project
-.pydevproject
-.settings/
-.docs/
 
 # OS files
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
-# Project specific
+# =============================================================================
+# Munajjam Library - Project Specific
+# =============================================================================
+
+# Audio files (users will have their own recitation files)
 *.wav
 *.mp3
 *.mp4
+
+# Database files
 *.db
 *.sqlite
 *.sqlite3
 
-# Audio files and reciter data
-Quran/
-
-# External tools and binaries
-ffmpeg*/
-ffmpeg-*/
-
-# Data directory (local dev/testing only - munajjam has bundled data)
-# Includes: reciter data, amma/, all reciter UUID directories, generated CSVs/JSONs
-data/
-
-# Cache directory (generated segments, silences, etc.)
+# Output directories (generated alignment results)
+output/
+output_*/
 cache/
 
-# Output directories (all generated JSON outputs)
-output/
-output_new/
-output_old/
-
-# Generated JSON files (output files, cache, data)
+# Generated JSON files (alignment outputs)
+# Allow example outputs in munajjam/examples
 *.json
-# But allow example JSON files in munajjam/examples
 !munajjam/examples/*.json
-# And allow package.json, pyproject.toml if they exist
-!package.json
-!tsconfig.json
 
-# Generated HTML visualizations
+# Generated HTML/CSV (analysis outputs)
 *.html
-!docs/**/*.html
-
-# Temporary and utility files
-remaining_files.txt
-USB_COPY_STATUS.md
-WORD_CHECK_ANALYSIS.md
-alignment_visualization.html
-ALIGNMENT_EXPLANATION.md
-*alignment*.json
-# Ignore alignment docs in root, but allow in docs/
-*alignment*.md
-!docs/**/*alignment*.md
-
-# Utility scripts (local dev only)
-article.md
-article1.md
-batch_process.py
-check_missing.py
-process_surah.py
-reprocess_failed.py
-debug_alignment.py
-test_*.py
-player.py
-run_player.sh
-copy_remaining_files.sh
-fast_copy_to_usb.sh
-setup_and_install.ps1
-scripts/download.py
-scripts/to_wav.py
+*.csv
