@@ -122,3 +122,4 @@ cache/
 # Generated HTML/CSV (analysis outputs)
 *.html
 *.csv
+batch_process.py
