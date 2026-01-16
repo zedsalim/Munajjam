@@ -87,29 +87,24 @@ Ayah 7: 33.98s - 46.44s
 
 ## Performance
 
-Munajjam automatically selects the fastest available implementation:
+Munajjam uses SIMD-accelerated string matching for fast alignment:
 
 | Implementation | Speed | Installation |
 |----------------|-------|--------------|
 | **Rust (munajjam_rs)** | **~6x faster** | Optional (see below) |
-| **rapidfuzz** | **~4x faster** | `pip install rapidfuzz` |
-| Pure Python (difflib) | 1x (baseline) | Built-in |
+| **rapidfuzz** | **~4x faster** | Included by default |
 
-### Installing Performance Accelerators
+### Optional: Rust Core (Maximum Performance)
 
-**Option 1: rapidfuzz (Recommended for most users)**
-```bash
-pip install rapidfuzz
-```
+For maximum performance, install the Rust accelerator:
 
-**Option 2: Rust core (Maximum performance)**
 ```bash
 cd munajjam-rs
 pip install maturin
 maturin develop --release
 ```
 
-The library automatically detects and uses the fastest available backend.
+The library automatically uses Rust when available, falling back to rapidfuzz.
 
 ### Benchmark Results (Apple M1)
 
@@ -118,7 +113,6 @@ Implementation    Ops/sec     Speedup
 -----------------------------------------
 Rust              159,430     5.89x
 rapidfuzz         105,743     3.91x
-Pure Python        27,058     1.00x (baseline)
 ```
 
 ## Alignment Strategies

@@ -5,10 +5,10 @@ This module provides functions for computing similarity between
 transcribed audio text and reference Quran text.
 
 Uses high-performance Rust implementations when available, with
-fallback to SIMD-accelerated rapidfuzz or pure Python implementations.
+fallback to SIMD-accelerated rapidfuzz.
 """
 
-from difflib import SequenceMatcher
+from rapidfuzz.distance import Indel as _rapidfuzz_indel
 
 from munajjam.core.arabic import normalize_arabic
 
@@ -19,25 +19,16 @@ try:
 except ImportError:
     _USE_RUST = False
 
-# Try to import rapidfuzz for SIMD-accelerated similarity (Python fallback)
-try:
-    from rapidfuzz.distance import Indel as _rapidfuzz_indel
-    _USE_RAPIDFUZZ = True
-except ImportError:
-    _USE_RAPIDFUZZ = False
-
 
 def similarity(text1: str, text2: str, normalize: bool = True) -> float:
     """
     Compute similarity ratio between two strings.
 
-    Uses SequenceMatcher to compute a ratio between 0.0 (no similarity)
-    and 1.0 (identical strings).
+    Returns a ratio between 0.0 (no similarity) and 1.0 (identical strings).
 
     Implementation priority:
     1. Rust (munajjam_rs) - fastest (~6x speedup)
-    2. rapidfuzz - SIMD-accelerated Python (~4x speedup)
-    3. difflib.SequenceMatcher - pure Python fallback
+    2. rapidfuzz - SIMD-accelerated C++ (~4x speedup)
 
     Args:
         text1: First string to compare
@@ -57,17 +48,12 @@ def similarity(text1: str, text2: str, normalize: bool = True) -> float:
     if _USE_RUST:
         return munajjam_rs.similarity(text1, text2, normalize)
 
-    # Fallback to Python implementations
+    # Fallback to rapidfuzz SIMD-accelerated implementation
     if normalize:
         text1 = normalize_arabic(text1)
         text2 = normalize_arabic(text2)
 
-    # Use rapidfuzz SIMD-accelerated implementation if available
-    if _USE_RAPIDFUZZ:
-        return _rapidfuzz_indel.normalized_similarity(text1, text2)
-
-    # Final fallback to pure Python SequenceMatcher
-    return SequenceMatcher(None, text1, text2).ratio()
+    return _rapidfuzz_indel.normalized_similarity(text1, text2)
 
 
 def get_first_words(text: str, n: int = 1, normalize: bool = True) -> str:
