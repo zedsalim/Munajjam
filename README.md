@@ -83,6 +83,43 @@ Ayah 7: 33.98s - 46.44s
 - **Arabic Text Normalization** - Handles diacritics, hamzas, and character variations
 - **Automatic Drift Correction** - Fixes timing drift in long recordings
 - **Quality Metrics** - Confidence scores for each aligned ayah
+- **High-Performance Rust Core** - Optional Rust acceleration for ~6x faster processing
+
+## Performance
+
+Munajjam automatically selects the fastest available implementation:
+
+| Implementation | Speed | Installation |
+|----------------|-------|--------------|
+| **Rust (munajjam_rs)** | **~6x faster** | Optional (see below) |
+| **rapidfuzz** | **~4x faster** | `pip install rapidfuzz` |
+| Pure Python (difflib) | 1x (baseline) | Built-in |
+
+### Installing Performance Accelerators
+
+**Option 1: rapidfuzz (Recommended for most users)**
+```bash
+pip install rapidfuzz
+```
+
+**Option 2: Rust core (Maximum performance)**
+```bash
+cd munajjam-rs
+pip install maturin
+maturin develop --release
+```
+
+The library automatically detects and uses the fastest available backend.
+
+### Benchmark Results (Apple M1)
+
+```
+Implementation    Ops/sec     Speedup
+-----------------------------------------
+Rust              159,430     5.89x
+rapidfuzz         105,743     3.91x
+Pure Python        27,058     1.00x (baseline)
+```
 
 ## Alignment Strategies
 
