@@ -243,6 +243,71 @@ def _detect_non_silent_fast(
     return chunks if chunks else [(0, duration_ms)]
 
 
+def compute_energy_envelope(
+    audio_path: str | Path,
+    window_ms: int = 50,
+) -> list[tuple[float, float]]:
+    """
+    Compute RMS energy envelope of an audio file.
+
+    Returns a list of (time_seconds, rms_energy) tuples at the given
+    window resolution. Useful for detecting local energy minima as
+    potential ayah boundary points.
+
+    Args:
+        audio_path: Path to audio file
+        window_ms: Window size in milliseconds (default 50ms)
+
+    Returns:
+        List of (time_sec, rms) tuples
+    """
+    import numpy as np
+    import librosa
+
+    y, sr = librosa.load(str(audio_path), sr=None)
+
+    frame_length = int(sr * window_ms / 1000)
+    hop_length = frame_length // 2
+
+    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop_length)
+
+    return [(float(t), float(r)) for t, r in zip(times, rms)]
+
+
+def find_energy_minima(
+    envelope: list[tuple[float, float]],
+    search_start: float,
+    search_end: float,
+    top_n: int = 3,
+) -> list[float]:
+    """
+    Find local energy minima within a time range.
+
+    Used to find the best boundary point near an estimated ayah boundary.
+
+    Args:
+        envelope: Energy envelope from compute_energy_envelope()
+        search_start: Start of search window (seconds)
+        search_end: End of search window (seconds)
+        top_n: Number of top minima to return
+
+    Returns:
+        List of times (seconds) at local energy minima, sorted by energy (lowest first)
+    """
+    candidates = [
+        (t, e) for t, e in envelope
+        if search_start <= t <= search_end
+    ]
+
+    if not candidates:
+        return []
+
+    # Sort by energy ascending (lowest energy = best boundary)
+    candidates.sort(key=lambda x: x[1])
+    return [t for t, _ in candidates[:top_n]]
+
+
 def load_audio_waveform(
     audio_path: str | Path,
     sample_rate: int = 16000,

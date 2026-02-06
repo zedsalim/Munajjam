@@ -34,7 +34,7 @@ class MunajjamSettings(BaseSettings):
     # ============ Model Settings ============
 
     model_id: str = Field(
-        default="tarteel-ai/whisper-base-ar-quran",
+        default="OdyAsh/faster-whisper-base-ar-quran",
         description="HuggingFace model ID for Whisper transcription",
     )
 
@@ -44,7 +44,7 @@ class MunajjamSettings(BaseSettings):
     )
 
     model_type: Literal["transformers", "faster-whisper"] = Field(
-        default="transformers",
+        default="faster-whisper",
         description="Model backend type",
     )
 

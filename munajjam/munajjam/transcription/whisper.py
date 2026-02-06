@@ -11,7 +11,7 @@ from typing import Callable, Literal
 from munajjam.config import MunajjamSettings, get_settings
 from munajjam.core.arabic import detect_segment_type
 from munajjam.exceptions import TranscriptionError, ModelNotLoadedError, AudioFileError
-from munajjam.models import Segment, SegmentType
+from munajjam.models import Segment, SegmentType, WordTimestamp
 from munajjam.transcription.base import BaseTranscriber
 from munajjam.transcription.silence import (
     detect_non_silent_chunks,
@@ -242,8 +242,11 @@ class WhisperTranscriber(BaseTranscriber):
                 continue
 
             # Transcribe segment
+            chunk_start_sec = start_ms / 1000.0
             try:
-                text = self._transcribe_segment(segment_audio, sr)
+                text, word_ts = self._transcribe_segment(
+                    segment_audio, sr, chunk_offset=chunk_start_sec,
+                )
             except Exception as e:
                 raise TranscriptionError(
                     f"Failed to transcribe segment at {start_ms}ms-{end_ms}ms: {e}",
@@ -263,6 +266,7 @@ class WhisperTranscriber(BaseTranscriber):
                 end=round(end_ms / 1000, 2),
                 text=text.strip(),
                 type=seg_type,
+                words=word_ts,
             )
 
             segments.append(segment)
@@ -273,12 +277,25 @@ class WhisperTranscriber(BaseTranscriber):
 
         return segments
 
-    def _transcribe_segment(self, segment_audio, sample_rate: int) -> str:
-        """Transcribe a single audio segment."""
+    def _transcribe_segment(
+        self,
+        segment_audio,
+        sample_rate: int,
+        chunk_offset: float = 0.0,
+    ) -> tuple[str, list[WordTimestamp] | None]:
+        """Transcribe a single audio segment.
+
+        Returns:
+            Tuple of (text, word_timestamps).  word_timestamps is None for
+            the transformers backend.
+        """
         if self._model_type == "faster-whisper":
-            return self._transcribe_faster_whisper(segment_audio, sample_rate)
+            return self._transcribe_faster_whisper(
+                segment_audio, sample_rate, chunk_offset=chunk_offset,
+            )
         else:
-            return self._transcribe_transformers(segment_audio, sample_rate)
+            text = self._transcribe_transformers(segment_audio, sample_rate)
+            return text, None
 
     def _transcribe_transformers(self, segment_audio, sample_rate: int) -> str:
         """Transcribe using Transformers."""
@@ -365,8 +382,17 @@ class WhisperTranscriber(BaseTranscriber):
                 # Restore transformers verbosity
                 transformers_logging.set_verbosity_warning()
 
-    def _transcribe_faster_whisper(self, segment_audio, sample_rate: int) -> str:
-        """Transcribe using Faster Whisper."""
+    def _transcribe_faster_whisper(
+        self,
+        segment_audio,
+        sample_rate: int,
+        chunk_offset: float = 0.0,
+    ) -> tuple[str, list[WordTimestamp] | None]:
+        """Transcribe using Faster Whisper.
+
+        Returns:
+            Tuple of (combined_text, word_timestamps).
+        """
         import tempfile
         import os
 
@@ -384,11 +410,13 @@ class WhisperTranscriber(BaseTranscriber):
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp_path = tmp.name
-            
+
             # Write audio to the temp file (file is closed now)
             sf.write(tmp_path, segment_audio, sample_rate)
 
-            # Transcribe
+            # Two-pass transcription:
+            # 1. Get text without word_timestamps (preserves original decoding quality)
+            # 2. Get word timestamps separately (word_timestamps=True can alter text)
             segments_result, _ = self._model.transcribe(
                 tmp_path,
                 beam_size=1,
@@ -400,8 +428,28 @@ class WhisperTranscriber(BaseTranscriber):
                 text = seg.text.strip()
                 break
 
-            return text
-            
+            # Second pass: get word-level timestamps
+            segments_result2, _ = self._model.transcribe(
+                tmp_path,
+                beam_size=1,
+                language="ar",
+                word_timestamps=True,
+            )
+
+            word_timestamps: list[WordTimestamp] = []
+            for seg in segments_result2:
+                if seg.words:
+                    for w in seg.words:
+                        word_timestamps.append(WordTimestamp(
+                            word=w.word.strip(),
+                            start=round(w.start + chunk_offset, 3),
+                            end=round(w.end + chunk_offset, 3),
+                            probability=round(w.probability, 4),
+                        ))
+                break  # First segment only, matches text pass
+
+            return text, word_timestamps if word_timestamps else None
+
         finally:
             # Clean up temp file
             if tmp_path and os.path.exists(tmp_path):
@@ -440,7 +488,7 @@ class WhisperTranscriber(BaseTranscriber):
             return ""
         
         # Transcribe the whole file as one segment
-        text = self._transcribe_segment(waveform, sr)
+        text, _ = self._transcribe_segment(waveform, sr)
         return text.strip()
 
     async def transcribe_async(self, audio_path: str | Path) -> list[Segment]:

@@ -24,6 +24,9 @@ from munajjam.core.aligner import Aligner, AlignmentStrategy, align
 from munajjam.core.arabic import normalize_arabic, detect_segment_type
 from munajjam.core.matcher import similarity
 
+# Word-level DP alignment
+from munajjam.core.word_level_dp import align_segments_word_dp
+
 # Stats classes - for inspecting results
 from munajjam.core.hybrid import HybridStats
 from munajjam.core.zone_realigner import ProblemZone, ZoneStats
@@ -37,6 +40,8 @@ __all__ = [
     "normalize_arabic",
     "detect_segment_type",
     "similarity",
+    # Word-level DP
+    "align_segments_word_dp",
     # Stats (for debugging/inspection)
     "HybridStats",
     "ProblemZone",
