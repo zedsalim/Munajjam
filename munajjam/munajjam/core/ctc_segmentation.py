@@ -104,28 +104,154 @@ def _load_full_audio(audio_path: str | Path):
     return waveform
 
 
+# Arabic letter → romanized approximation for MMS_FA tokenizer.
+# MMS_FA vocabulary: - a i e n o u t s r m k l d g h y b p w c v j z f ' q x *
+_ARABIC_TO_ROMAN: dict[str, str] = {
+    "ا": "a",
+    "ب": "b",
+    "ت": "t",
+    "ث": "s",   # th → s (closest available)
+    "ج": "j",
+    "ح": "h",
+    "خ": "x",   # kh → x
+    "د": "d",
+    "ذ": "d",   # dh → d
+    "ر": "r",
+    "ز": "z",
+    "س": "s",
+    "ش": "s",   # sh → s
+    "ص": "s",   # emphatic s
+    "ض": "d",   # emphatic d
+    "ط": "t",   # emphatic t
+    "ظ": "z",   # emphatic z
+    "ع": "a",   # ain → a (guttural)
+    "غ": "g",   # ghain → g
+    "ف": "f",
+    "ق": "q",
+    "ك": "k",
+    "ل": "l",
+    "م": "m",
+    "ن": "n",
+    "ه": "h",
+    "و": "w",
+    "ي": "y",
+    " ": " ",
+}
+
+
 def _normalize_text_for_ctc(text: str) -> str:
-    """Normalize Arabic text for the CTC tokenizer."""
+    """Normalize Arabic text and transliterate to romanized form for MMS_FA."""
     from .arabic import normalize_arabic
-    return normalize_arabic(text).strip()
+
+    normalized = normalize_arabic(text).strip()
+
+    # Transliterate Arabic → romanized
+    roman_chars: list[str] = []
+    for ch in normalized:
+        mapped = _ARABIC_TO_ROMAN.get(ch)
+        if mapped is not None:
+            roman_chars.append(mapped)
+        # Skip characters not in the mapping (punctuation, digits, etc.)
+
+    romanized = "".join(roman_chars)
+    # Collapse multiple spaces
+    import re
+    romanized = re.sub(r"\s+", " ", romanized).strip()
+    return romanized
 
 
 def _tokenize_text(text: str) -> list[int]:
-    """Convert text to token indices, skipping unknown characters."""
-    tokens = _TOKENIZER(text)
-    return tokens if tokens else []
+    """Convert romanized text to token indices, skipping unknown characters.
+
+    The MMS_FA tokenizer expects ``List[str]`` (list of words), where each
+    word is a string of characters that exist in its dictionary.  It returns
+    ``List[List[int]]`` (token ids per word).  We flatten them into a single
+    list suitable for CTC segmentation.
+    """
+    known = set(_TOKENIZER.dictionary.keys()) if hasattr(_TOKENIZER, "dictionary") else set()
+
+    # Split into words, filter each word to known characters only
+    words: list[str] = []
+    for w in text.split():
+        filtered = "".join(ch for ch in w if ch in known)
+        if filtered:
+            words.append(filtered)
+
+    if not words:
+        return []
+
+    # Tokenizer returns List[List[int]] — flatten to a single list
+    nested = _TOKENIZER(words)
+    return [tok for word_toks in nested for tok in word_toks]
 
 
-def _get_log_probs(waveform) -> np.ndarray:
-    """Run the CTC model and return log-probability matrix (T, V)."""
+def _get_log_probs(waveform, chunk_seconds: float = 30.0, overlap_seconds: float = 1.0) -> np.ndarray:
+    """Run the CTC model and return log-probability matrix (T, V).
+
+    For long audio, processes in overlapping chunks to avoid GPU OOM.
+    Each chunk is ``chunk_seconds`` long with ``overlap_seconds`` overlap
+    to avoid boundary artefacts.  Overlap regions are discarded (we keep
+    the interior portion of each chunk).
+    """
     import torch
 
-    with torch.no_grad():
-        emission, _ = _MODEL(waveform.to(_DEVICE))
+    total_samples = waveform.shape[1]
+    chunk_samples = int(chunk_seconds * _SAMPLE_RATE)
+    overlap_samples = int(overlap_seconds * _SAMPLE_RATE)
 
-    # emission shape: (1, T, V)
-    log_probs = torch.nn.functional.log_softmax(emission[0], dim=-1)
-    return log_probs.cpu().numpy()
+    # If the waveform fits in one chunk, process directly
+    if total_samples <= chunk_samples:
+        with torch.no_grad():
+            emission, _ = _MODEL(waveform.to(_DEVICE))
+        log_probs = torch.nn.functional.log_softmax(emission[0], dim=-1)
+        return log_probs.cpu().numpy()
+
+    # --- Chunked processing ---
+    step_samples = chunk_samples - overlap_samples
+    chunks_log_probs: list[np.ndarray] = []
+
+    # First pass: process one small chunk to learn the samples-to-frames ratio
+    probe = waveform[:, :chunk_samples]
+    with torch.no_grad():
+        probe_em, _ = _MODEL(probe.to(_DEVICE))
+    probe_frames = probe_em.shape[1]
+    ratio = chunk_samples / probe_frames  # samples per frame
+    overlap_frames = max(1, int(overlap_samples / ratio))
+
+    # Process the probe chunk (reuse it)
+    probe_lp = torch.nn.functional.log_softmax(probe_em[0], dim=-1).cpu().numpy()
+    del probe_em
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    offset = 0
+    chunk_idx = 0
+    while offset < total_samples:
+        end = min(offset + chunk_samples, total_samples)
+        chunk_wav = waveform[:, offset:end]
+
+        if chunk_idx == 0:
+            # Reuse the probe we already computed
+            lp = probe_lp
+        else:
+            with torch.no_grad():
+                em, _ = _MODEL(chunk_wav.to(_DEVICE))
+            lp = torch.nn.functional.log_softmax(em[0], dim=-1).cpu().numpy()
+            del em
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        # Trim overlap: discard the first overlap_frames for all chunks
+        # except the first, and discard the last overlap_frames for all
+        # chunks except the last.
+        trim_start = overlap_frames if chunk_idx > 0 else 0
+        trim_end = lp.shape[0]  # keep to end by default
+
+        chunks_log_probs.append(lp[trim_start:trim_end])
+
+        offset += step_samples
+        chunk_idx += 1
+
+    del probe_lp
+    return np.concatenate(chunks_log_probs, axis=0)
 
 
 def _ctc_segmentation_dp(
@@ -139,8 +265,9 @@ def _ctc_segmentation_dp(
     Given frame-level log-probabilities and per-ayah token sequences,
     finds the optimal frame boundaries for each ayah.
 
-    The algorithm concatenates all ayah tokens with a blank separator
-    and builds a CTC trellis to find where each ayah begins and ends.
+    Memory-efficient: instead of storing the full (T, S) trellis, only
+    tracks scores at ayah separator positions needed for boundary
+    detection, plus a running confidence accumulator per ayah.
 
     Args:
         log_probs: Shape (T, V) — log probabilities per frame per token.
@@ -151,16 +278,14 @@ def _ctc_segmentation_dp(
         List of (start_frame, end_frame, confidence) per ayah.
     """
     T, V = log_probs.shape
+    n_ayahs = len(token_sequences)
 
     # Build the concatenated token sequence with blank separators.
-    # Also record where each ayah's tokens start and end in the
-    # concatenated sequence.
     concat_tokens: list[int] = []
     ayah_boundaries: list[tuple[int, int]] = []  # (start, end) in concat_tokens
 
     for seq in token_sequences:
         if not seq:
-            # Empty token sequence — use a single blank
             start = len(concat_tokens)
             concat_tokens.append(blank_id)
             ayah_boundaries.append((start, start + 1))
@@ -170,132 +295,130 @@ def _ctc_segmentation_dp(
         concat_tokens.extend(seq)
         end = len(concat_tokens)
         ayah_boundaries.append((start, end))
-        # Add blank separator between ayahs
         concat_tokens.append(blank_id)
 
     S = len(concat_tokens)
 
     if S == 0 or T == 0:
-        return [(0, T, 0.0)] * len(token_sequences)
+        return [(0, T, 0.0)] * n_ayahs
 
-    # Build CTC trellis: dp[t][s] = log probability of being at position s
-    # in the token sequence at frame t.
-    # We use a simplified forward pass that allows staying in the same
-    # token or advancing to the next token (standard CTC transitions).
     NEG_INF = -1e10
 
-    # Only keep two rows at a time to save memory
-    prev = np.full(S, NEG_INF, dtype=np.float64)
-    curr = np.full(S, NEG_INF, dtype=np.float64)
+    # Identify separator token positions (the blank after each ayah).
+    # These are the columns we need to track for boundary detection.
+    sep_positions: list[int] = []  # one per boundary (n_ayahs - 1)
+    for i in range(n_ayahs - 1):
+        sep_s = ayah_boundaries[i][1]
+        if sep_s >= S:
+            sep_s = S - 1
+        sep_positions.append(sep_s)
 
-    # Also track the "most likely frame" for each token position
-    # using a separate backtrack pass. For efficiency we track
-    # cumulative log-prob sums and derive boundaries from them.
-
-    # Forward pass: compute cumulative probability at each (t, s)
-    # Initialize: at t=0, we can be at s=0 (blank/first token)
-    prev[0] = log_probs[0, concat_tokens[0]]
-    if S > 1:
-        prev[1] = log_probs[0, concat_tokens[1]]
-
-    # Store per-frame per-token log probs for boundary detection
-    # We'll track the max-prob frame for each token boundary region
-    token_frame_scores = np.full((T, S), NEG_INF, dtype=np.float32)
-    token_frame_scores[0, 0] = float(prev[0])
-    if S > 1:
-        token_frame_scores[0, 1] = float(prev[1])
-
-    for t in range(1, T):
-        curr[:] = NEG_INF
-
-        for s in range(S):
-            tok = concat_tokens[s]
-            emit_prob = log_probs[t, tok]
-
-            # Transition 1: stay at same position
-            stay = prev[s]
-
-            # Transition 2: advance from previous position
-            advance = prev[s - 1] if s > 0 else NEG_INF
-
-            # Transition 3: skip blank (if current and prev-prev are different)
-            skip = NEG_INF
-            if s > 1 and concat_tokens[s] != concat_tokens[s - 2]:
-                skip = prev[s - 2]
-
-            curr[s] = np.logaddexp(stay, np.logaddexp(advance, skip)) + emit_prob
-            token_frame_scores[t, s] = float(curr[s])
-
-        prev, curr = curr, prev
-
-    # Backward pass: find optimal boundary frames for each ayah.
-    # The key insight: for each ayah's token range [s_start, s_end),
-    # the frame where we transition INTO s_start and OUT OF s_end-1
-    # gives us the ayah boundaries.
-    #
-    # We use a greedy backward approach: start from the end, find the
-    # best frame for each boundary by looking at cumulative scores.
-
-    results: list[tuple[int, int, float]] = []
-
-    # Find the best total endpoint
-    final_scores = token_frame_scores[T - 1, :]
-    best_end_s = S - 1  # Should end at the last token position
-
-    # Use simple proportional boundary estimation refined by score peaks.
-    # For each ayah boundary, find the frame with the best score transition.
-    n_ayahs = len(token_sequences)
-
-    # Compute expected frame boundaries proportional to token counts
-    total_tokens = sum(max(len(seq), 1) for seq in token_sequences)
+    # Pre-compute proportional expected boundaries and search windows
+    total_tokens_count = sum(max(len(seq), 1) for seq in token_sequences)
     cum_tokens = [0]
     for seq in token_sequences:
         cum_tokens.append(cum_tokens[-1] + max(len(seq), 1))
 
-    frame_boundaries: list[int] = [0]
-
+    expected_frames: list[int] = []
+    search_ranges: list[tuple[int, int]] = []
     for i in range(n_ayahs - 1):
-        # Expected boundary frame
-        expected = int(T * cum_tokens[i + 1] / total_tokens)
-
-        # Search window: +/- 15% of total frames, but at least 20 frames
+        expected = int(T * cum_tokens[i + 1] / total_tokens_count)
         window = max(int(T * 0.15), 20)
-        search_lo = max(1, expected - window)
-        search_hi = min(T - 1, expected + window)
+        lo = max(1, expected - window)
+        hi = min(T - 1, expected + window)
+        expected_frames.append(expected)
+        search_ranges.append((lo, hi))
 
-        # For the boundary between ayah i and i+1, look at the blank
-        # separator token that was inserted between them.
-        sep_s = ayah_boundaries[i][1]  # The blank after ayah i's tokens
-        if sep_s >= S:
-            sep_s = S - 1
+    # Memory-efficient storage: only keep separator scores within
+    # each search window, plus per-ayah confidence accumulators.
+    # sep_scores[i] maps frame_t -> score for the i-th separator
+    sep_best_frame = [expected_frames[i] for i in range(n_ayahs - 1)]
+    sep_best_score = [NEG_INF] * (n_ayahs - 1)
 
-        # Find the frame where the blank separator has the highest score
-        # (this is where the pause between ayahs most likely occurs)
-        best_frame = expected
-        best_score = NEG_INF
+    # For confidence: track running max score per ayah region per frame
+    # We accumulate sum of max-over-tokens scores per ayah
+    ayah_confidence_sum = [0.0] * n_ayahs
+    ayah_confidence_count = [0] * n_ayahs
 
-        for t in range(search_lo, search_hi + 1):
-            # Score at the separator position
-            score = token_frame_scores[t, min(sep_s, S - 1)]
-            if score > best_score:
-                best_score = score
-                best_frame = t
+    # Vectorized forward pass using numpy operations
+    concat_tokens_arr = np.array(concat_tokens, dtype=np.int64)
 
-        frame_boundaries.append(best_frame)
+    prev = np.full(S, NEG_INF, dtype=np.float64)
+    curr = np.full(S, NEG_INF, dtype=np.float64)
 
+    # Initialize
+    prev[0] = log_probs[0, concat_tokens[0]]
+    if S > 1:
+        prev[1] = log_probs[0, concat_tokens[1]]
+
+    # Process t=0 for confidence tracking
+    for ai in range(n_ayahs):
+        s_start, s_end = ayah_boundaries[ai]
+        region = prev[s_start:s_end]
+        mx = float(np.max(region)) if region.size > 0 else NEG_INF
+        if mx > NEG_INF / 2:
+            ayah_confidence_sum[ai] += mx
+            ayah_confidence_count[ai] += 1
+
+    for t in range(1, T):
+        # Vectorized emission lookup
+        emit_probs = log_probs[t, concat_tokens_arr]  # shape (S,)
+
+        # Transition: stay
+        curr[:] = prev
+
+        # Transition: advance from s-1
+        advance = np.full(S, NEG_INF, dtype=np.float64)
+        advance[1:] = prev[:-1]
+        curr = np.logaddexp(curr, advance)
+
+        # Transition: skip blank (s-2) where tokens differ
+        if S > 2:
+            skip = np.full(S, NEG_INF, dtype=np.float64)
+            skip[2:] = prev[:-2]
+            # Mask: only allow skip where concat_tokens[s] != concat_tokens[s-2]
+            same_mask = concat_tokens_arr[2:] == concat_tokens_arr[:-2]
+            skip[2:][same_mask] = NEG_INF
+            curr = np.logaddexp(curr, skip)
+
+        curr += emit_probs
+
+        # Track separator scores for boundary detection
+        for i in range(n_ayahs - 1):
+            lo, hi = search_ranges[i]
+            if lo <= t <= hi:
+                score = float(curr[sep_positions[i]])
+                if score > sep_best_score[i]:
+                    sep_best_score[i] = score
+                    sep_best_frame[i] = t
+
+        # Track per-ayah confidence (sample every 4th frame for speed)
+        if t % 4 == 0:
+            for ai in range(n_ayahs):
+                s_start, s_end = ayah_boundaries[ai]
+                region = curr[s_start:s_end]
+                if region.size > 0:
+                    mx = float(np.max(region))
+                    if mx > NEG_INF / 2:
+                        ayah_confidence_sum[ai] += mx
+                        ayah_confidence_count[ai] += 1
+
+        prev, curr = curr, prev
+
+    # Build frame boundaries from separator peaks
+    frame_boundaries: list[int] = [0]
+    for i in range(n_ayahs - 1):
+        frame_boundaries.append(sep_best_frame[i])
     frame_boundaries.append(T)
 
-    # Convert frame indices to results
+    # Build results
+    results: list[tuple[int, int, float]] = []
     for i in range(n_ayahs):
         start_frame = frame_boundaries[i]
         end_frame = frame_boundaries[i + 1]
 
-        # Compute confidence from average log-prob in this ayah's region
-        s_start, s_end = ayah_boundaries[i]
-        region_scores = token_frame_scores[start_frame:end_frame, s_start:s_end]
-        if region_scores.size > 0:
-            # Normalize confidence to 0-1 range
-            avg_log_prob = float(np.mean(np.max(region_scores, axis=1)))
+        if ayah_confidence_count[i] > 0:
+            avg_log_prob = ayah_confidence_sum[i] / ayah_confidence_count[i]
             confidence = min(1.0, max(0.0, np.exp(avg_log_prob)))
         else:
             confidence = 0.0
@@ -336,14 +459,22 @@ def ctc_segment_ayahs(
         # Load audio
         waveform = _load_full_audio(audio_path)
         audio_duration = waveform.shape[1] / _SAMPLE_RATE
+        total_samples = waveform.shape[1]
+        logger.info(
+            "CTC: audio %.1f min, %d samples",
+            audio_duration / 60, total_samples,
+        )
 
-        # Get frame-level log probabilities
+        # Get frame-level log probabilities (chunked for long audio)
         log_probs = _get_log_probs(waveform)
         T = log_probs.shape[0]
 
         # Compute frames-to-seconds ratio
-        ratio = waveform.shape[1] / T  # samples per frame
+        ratio = total_samples / T  # samples per frame
         frame_to_sec = ratio / _SAMPLE_RATE
+
+        # Free waveform — no longer needed
+        del waveform
 
         # Tokenize all ayah texts
         token_sequences: list[list[int]] = []

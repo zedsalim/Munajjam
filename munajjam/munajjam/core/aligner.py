@@ -95,20 +95,28 @@ class Aligner:
     def _select_strategy(self, ayahs: list[Ayah]) -> AlignmentStrategy:
         """Pick the best concrete strategy based on surah characteristics.
 
-        When audio_path is available and CTC segmentation is supported,
-        prefer CTC_SEG as it uses acoustic evidence directly.
-        Otherwise: word_dp for short-ayah surahs, hybrid for long-ayah ones.
+        For long surahs (>4000 words): HYBRID (segment-DP + greedy fallback)
+        handles timing drift much better than word-level DP.  CTC refinement
+        still runs as a post-processing step via ``ctc_refine``.
+
+        For shorter surahs with audio: CTC_SEG uses acoustic evidence with
+        word-DP baseline for best precision.
+
+        Without audio: word_dp for short surahs, hybrid for long ones.
         """
-        # Prefer CTC segmentation when audio is available
+        total_words = sum(len(a.text.split()) for a in ayahs)
+        avg_words = total_words / len(ayahs) if ayahs else 0
+
+        # Long surahs: HYBRID handles drift better
+        if total_words > 4000 and avg_words > 15:
+            return AlignmentStrategy.HYBRID
+
+        # Shorter surahs with audio: CTC_SEG for acoustic precision
         if self.audio_path:
             from .ctc_segmentation import is_available as ctc_available
             if ctc_available():
                 return AlignmentStrategy.CTC_SEG
 
-        total_words = sum(len(a.text.split()) for a in ayahs)
-        avg_words = total_words / len(ayahs) if ayahs else 0
-        if total_words > 4000 and avg_words > 15:
-            return AlignmentStrategy.HYBRID
         return AlignmentStrategy.WORD_DP
 
     def align(
@@ -290,26 +298,39 @@ class Aligner:
         if not ctc_results:
             return word_dp_results
 
-        # Per-ayah fusion: keep the result with higher similarity.
-        # Build lookup by ayah number.
+        # Per-ayah fusion: keep the result with higher similarity,
+        # but only use CTC if its boundaries are temporally sane.
         ctc_by_ayah = {r.ayah.ayah_number: r for r in ctc_results}
         dp_by_ayah = {r.ayah.ayah_number: r for r in word_dp_results}
 
         fused: list[AlignmentResult] = []
+        prev_end = 0.0
+
         for ayah in ayahs:
             ctc_r = ctc_by_ayah.get(ayah.ayah_number)
             dp_r = dp_by_ayah.get(ayah.ayah_number)
 
-            if ctc_r and dp_r:
-                # Pick whichever has higher similarity
+            # Validate CTC result: timestamps must be monotonic and
+            # not jump backwards significantly from the previous end.
+            ctc_valid = False
+            if ctc_r:
+                ctc_valid = (
+                    ctc_r.start_time >= prev_end - 1.0  # allow 1s tolerance
+                    and ctc_r.end_time > ctc_r.start_time
+                )
+
+            if ctc_valid and dp_r:
                 if ctc_r.similarity_score >= dp_r.similarity_score:
                     fused.append(ctc_r)
                 else:
                     fused.append(dp_r)
             elif dp_r:
                 fused.append(dp_r)
-            elif ctc_r:
+            elif ctc_valid:
                 fused.append(ctc_r)
+
+            if fused:
+                prev_end = fused[-1].end_time
 
         return fused if fused else word_dp_results
 
