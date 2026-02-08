@@ -20,10 +20,6 @@ Munajjam is a Python library that:
 pip install munajjam
 ```
 
-This installs all core dependencies including `torch`, `torchaudio`, `librosa`, and `numpy`.
-CTC-based alignment (CTC segmentation and forced alignment) requires `torchaudio` with the
-MMS model, which downloads automatically on first use.
-
 For faster transcription using CTranslate2:
 
 ```bash
@@ -94,8 +90,6 @@ munajjam/
 ├── core/                  # Alignment algorithms
 │   ├── aligner.py         # Aligner class (main entry point)
 │   ├── word_level_dp.py   # Word-level DP alignment
-│   ├── ctc_segmentation.py # CTC acoustic segmentation
-│   ├── forced_aligner.py  # CTC forced alignment refinement
 │   ├── phonetic.py        # Phonetic similarity scoring
 │   └── zone_realigner.py  # Multi-pass zone realignment
 ├── transcription/         # Audio transcription (Whisper implementations)
@@ -123,12 +117,11 @@ aligner = Aligner("001.mp3", strategy="word_dp")
 # Or with full custom configuration
 aligner = Aligner(
     "001.mp3",              # Audio file path (required)
-    strategy="auto",        # "greedy", "dp", "hybrid", "word_dp", "ctc_seg", or "auto" (default)
+    strategy="auto",        # "greedy", "dp", "hybrid", "word_dp", or "auto" (default)
     quality_threshold=0.85, # Similarity threshold for high-quality alignment
     fix_drift=True,         # Run zone realignment for long surahs
     fix_overlaps=True,      # Fix overlapping ayah timings
     min_gap=0.3,            # Minimum gap between consecutive ayahs (seconds)
-    ctc_refine=True,        # CTC forced alignment refinement (default True)
     energy_snap=True,       # Snap boundaries to energy minima (default True)
 )
 
@@ -160,16 +153,14 @@ results = align("001.mp3", segments, ayahs)
 
 | Strategy | Description | Use Case |
 |----------|-------------|----------|
-| `auto` | Picks best strategy based on surah size | **Recommended** - HYBRID for long surahs, CTC for short |
+| `auto` | Picks best strategy based on surah size | **Recommended** - HYBRID for long surahs, WORD_DP for short |
 | `word_dp` | Word-level DP with per-word timestamps | Sub-segment precision |
-| `ctc_seg` | CTC acoustic segmentation + word-DP fusion | Frame-accurate boundaries (short/medium surahs) |
 | `greedy` | Fast, simple matching | Quick prototyping |
 | `dp` | Dynamic programming for optimal alignment | High accuracy needed |
 | `hybrid` | DP with fallback to greedy | Long surahs with timing drift |
 
 > **AUTO strategy selection:** For long surahs (>4000 words), AUTO selects HYBRID which handles
-> timing drift better. For shorter surahs with audio, it selects CTC_SEG for acoustic precision.
-> CTC refinement still runs as a post-processing step regardless of the primary strategy.
+> timing drift better. For shorter surahs, it selects WORD_DP for precise word-level alignment.
 
 ## Models
 
@@ -239,27 +230,6 @@ score = similarity("بسم الله", "بسم الله الرحمن")
 ```
 
 ## Advanced Features
-
-### CTC Segmentation
-
-Use CTC acoustic models for frame-accurate ayah boundaries:
-
-```python
-aligner = Aligner("001.mp3", strategy="ctc_seg")
-results = aligner.align(segments, ayahs)
-```
-
-> **Long audio note:** CTC inference automatically processes audio in 30-second overlapping chunks
-> to avoid GPU memory issues. This is transparent — no configuration needed.
-
-### CTC Refinement
-
-CTC forced alignment runs by default as a post-processing step. To disable it:
-
-```python
-aligner = Aligner("001.mp3", ctc_refine=False)
-results = aligner.align(segments, ayahs)
-```
 
 ### Phonetic Similarity
 

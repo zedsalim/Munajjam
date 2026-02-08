@@ -1155,78 +1155,6 @@ def realign_drift_zones_word_dp(
     return new_results, stats
 
 
-def refine_low_confidence_zones_with_ctc(
-    results: list[AlignmentResult],
-    audio_path: str,
-    similarity_threshold: float = 0.75,
-    min_consecutive: int = 2,
-    min_ctc_score: float = 0.3,
-    max_pace_ratio: float = 2.5,
-    max_shift_seconds: float = 20.0,
-) -> tuple[list[AlignmentResult], int]:
-    """
-    Refine only problematic zones with CTC forced alignment.
-
-    Problematic means consecutive ayahs that are either:
-    - low similarity, or
-    - pace outliers relative to the surah median.
-
-    Returns:
-        Tuple of (updated_results, refined_ayah_count).
-    """
-    if not results or not audio_path:
-        return results, 0
-
-    from .forced_aligner import is_available, refine_alignment_results
-
-    if not is_available():
-        return results, 0
-
-    zones = _find_problem_runs(
-        results=results,
-        similarity_threshold=similarity_threshold,
-        min_consecutive=min_consecutive,
-        max_pace_ratio=max_pace_ratio,
-    )
-    if not zones:
-        return results, 0
-
-    updated = list(results)
-    refined_total = 0
-
-    # Process in reverse so index slicing/replacement stays stable.
-    for start_idx, end_idx in reversed(zones):
-        zone_results = list(updated[start_idx:end_idx])
-
-        refined = refine_alignment_results(
-            results=zone_results,
-            audio_path=audio_path,
-            min_similarity=0.0,  # include low-confidence ayahs
-            min_ctc_score=min_ctc_score,
-        )
-        if refined <= 0:
-            continue
-
-        # Guard against pathological jumps in case CTC snaps to a wrong region.
-        for i in range(start_idx, end_idx):
-            old = updated[i]
-            new = zone_results[i - start_idx]
-
-            if new.end_time <= new.start_time:
-                continue
-
-            shift = max(
-                abs(new.start_time - old.start_time),
-                abs(new.end_time - old.end_time),
-            )
-            if shift > max_shift_seconds:
-                continue
-
-            updated[i] = new
-
-        refined_total += refined
-
-    return updated, refined_total
 
 
 # Export for use in other modules
@@ -1238,7 +1166,6 @@ __all__ = [
     'realign_drift_zones_word_dp',
     'adaptive_quality_threshold',
     'realign_from_anchors',
-    'refine_low_confidence_zones_with_ctc',
     'find_anchors',
     'fix_overlaps',
     'snap_boundaries_to_silences',
