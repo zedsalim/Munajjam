@@ -33,9 +33,9 @@ def main():
     ayahs = load_surah_ayahs(surah_number)
     print(f"  Loaded {len(ayahs)} ayahs\n")
 
-    # Step 3: Align segments to ayahs (uses hybrid strategy by default)
+    # Step 3: Align segments to ayahs (auto strategy by default, or pass strategy="word_dp" etc.)
     print("Step 3: Aligning segments to ayahs...")
-    results = align(segments, ayahs)
+    results = align(audio_path, segments, ayahs)
     print(f"  Aligned {len(results)} ayahs\n")
 
     # Step 4: Display results

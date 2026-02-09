@@ -5,6 +5,7 @@ This example demonstrates advanced usage:
 - Custom configuration settings
 - Silence detection and usage
 - Progress tracking
+- CTC refinement and energy snap
 - Detailed result inspection
 """
 
@@ -31,9 +32,9 @@ def main():
     # Step 1: Configure global settings
     print("\nStep 1: Configuring Munajjam...")
     configure(
-        model_id="tarteel-ai/whisper-base-ar-quran",
+        model_id="OdyAsh/faster-whisper-base-ar-quran",
         device="auto",  # Auto-detect GPU/CPU
-        model_type="transformers",
+        model_type="faster-whisper",
         silence_threshold_db=-30,
         min_silence_ms=300,
         buffer_seconds=0.3,
@@ -79,10 +80,13 @@ def main():
     print("\nStep 5: Aligning with advanced settings...")
 
     aligner = Aligner(
-        strategy="hybrid",
+        audio_path=audio_path,   # Audio file (required)
+        strategy="auto",
         quality_threshold=0.85,  # Threshold for high-quality alignment
         fix_drift=True,          # Enable zone realignment
-        fix_overlaps=True        # Fix overlapping ayahs
+        fix_overlaps=True,       # Fix overlapping ayahs
+        ctc_refine=True,         # Refine boundaries with CTC forced alignment (default)
+        energy_snap=True,        # Snap boundaries to energy minima (default)
     )
 
     results = aligner.align(

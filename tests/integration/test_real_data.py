@@ -46,7 +46,7 @@ class TestRealDataAlignment:
             for i, ayah in enumerate(ayahs[:3])
         ]
 
-        aligner = Aligner(strategy="hybrid")
+        aligner = Aligner(audio_path="test.wav", strategy="hybrid", energy_snap=False)
         results = aligner.align(segments, ayahs[:3])
 
         assert len(results) > 0
@@ -65,7 +65,7 @@ class TestRealDataAlignment:
             for i, ayah in enumerate(ayahs)
         ]
 
-        aligner = Aligner(strategy=strategy)
+        aligner = Aligner(audio_path="test.wav", strategy=strategy, energy_snap=False)
         results = aligner.align(segments, ayahs)
 
         assert len(results) > 0

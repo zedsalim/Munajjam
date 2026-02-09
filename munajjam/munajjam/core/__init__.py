@@ -10,10 +10,10 @@ Primary API:
     from munajjam.core import Aligner, AlignmentStrategy, align
 
     # Simple usage
-    results = align(segments, ayahs)
+    results = align("001.mp3", segments, ayahs)
 
     # With configuration
-    aligner = Aligner(strategy="hybrid", fix_drift=True)
+    aligner = Aligner("001.mp3", fix_drift=True)
     results = aligner.align(segments, ayahs, silences_ms=silences)
 """
 

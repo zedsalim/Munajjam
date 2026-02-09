@@ -39,7 +39,7 @@ jobs:
 
       - name: Run tests
         working-directory: ./munajjam
-        run: pytest --cov=munajjam --cov-report=xml
+        run: pytest
 
   build:
     runs-on: ubuntu-latest

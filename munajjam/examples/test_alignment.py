@@ -74,7 +74,7 @@ def test_with_transcription(audio_path: str, surah_id: int):
     print(f"   Loaded {len(ayahs)} reference ayahs")
     
     start = time.time()
-    aligner = Aligner(strategy="hybrid")
+    aligner = Aligner(audio_path=audio_path)
     results = aligner.align(segments, ayahs, silences_ms=silences)
     align_time = time.time() - start
     print(f"   Aligned {len(results)}/{len(ayahs)} ayahs in {align_time:.2f}s")
@@ -191,7 +191,7 @@ def test_with_existing_segments(surah_id: int):
     # Align
     print("\n🔗 Aligning...")
     start = time.time()
-    aligner = Aligner(strategy="hybrid")
+    aligner = Aligner(audio_path=audio_path)
     results = aligner.align(segments, ayahs, silences_ms=silences)
     align_time = time.time() - start
     print(f"   Aligned {len(results)}/{len(ayahs)} ayahs in {align_time:.2f}s")

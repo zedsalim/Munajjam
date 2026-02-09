@@ -55,9 +55,9 @@ from munajjam.data import load_surah_ayahs
 with WhisperTranscriber() as transcriber:
     segments = transcriber.transcribe("001.mp3")
 
-# Align to ayahs
+# Align to ayahs (uses auto strategy by default; override with "greedy", "dp", or "hybrid")
 ayahs = load_surah_ayahs(1)
-results = align(segments, ayahs)
+results = align("001.mp3", segments, ayahs)
 
 # Get timestamps
 for result in results:
@@ -78,25 +78,32 @@ Ayah 7: 33.98s - 46.44s
 
 ## Features
 
-- **Whisper Transcription** - Uses Tarteel AI's Quran-tuned Whisper models
-- **Multiple Alignment Strategies** - Greedy, Dynamic Programming, or Hybrid (recommended)
+- **Whisper Transcription** - Uses faster-whisper as default backend with Quran-tuned models
+- **Four Alignment Strategies** - Auto, Hybrid, DP, and Greedy
 - **Arabic Text Normalization** - Handles diacritics, hamzas, and character variations
-- **Automatic Drift Correction** - Fixes timing drift in long recordings
+- **Automatic Drift Correction** - Multi-pass zone realignment for long recordings
 - **Quality Metrics** - Confidence scores for each aligned ayah
+- **Phonetic Similarity** - Arabic ASR confusion-aware similarity scoring
+- **Word-level Precision** - Uses per-word timestamps (when available) to improve drift recovery
 
 ## Alignment Strategies
+
+The default `auto` strategy works best for most cases. You can override it:
 
 ```python
 from munajjam.core import Aligner
 
-# Hybrid (recommended) - best balance of speed and accuracy
-aligner = Aligner(strategy="hybrid")
+# Auto (recommended) - picks the best strategy, full pipeline by default
+aligner = Aligner("001.mp3")
+
+# Hybrid - DP with greedy fallback (legacy)
+aligner = Aligner("001.mp3", strategy="hybrid")
 
 # Greedy - fastest, good for clean recordings
-aligner = Aligner(strategy="greedy")
+aligner = Aligner("001.mp3", strategy="greedy")
 
-# DP - most accurate, slower
-aligner = Aligner(strategy="dp")
+# DP - optimal alignment using dynamic programming
+aligner = Aligner("001.mp3", strategy="dp")
 
 results = aligner.align(segments, ayahs)
 ```

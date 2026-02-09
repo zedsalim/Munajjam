@@ -8,7 +8,7 @@ strategies and handles all post-processing (zone realignment, overlap fixing).
 Usage:
     from munajjam.core import Aligner
 
-    aligner = Aligner(strategy="hybrid")
+    aligner = Aligner(audio_path="001.mp3")
     results = aligner.align(segments, ayahs, silences_ms=silences)
 """
 
@@ -24,6 +24,7 @@ class AlignmentStrategy(str, Enum):
     GREEDY = "greedy"  # Fast, simple greedy matching
     DP = "dp"  # Dynamic programming for optimal alignment
     HYBRID = "hybrid"  # DP with fallback to greedy (recommended)
+    AUTO = "auto"  # Automatically pick best strategy
 
 
 class Aligner:
@@ -40,7 +41,7 @@ class Aligner:
         fix_overlaps: Whether to fix overlapping ayah timings
 
     Example:
-        >>> aligner = Aligner(strategy="hybrid")
+        >>> aligner = Aligner(audio_path="001.mp3")
         >>> results = aligner.align(segments, ayahs)
         >>> for r in results:
         ...     print(f"Ayah {r.ayah.ayah_number}: {r.start_time:.2f}s - {r.end_time:.2f}s")
@@ -48,19 +49,25 @@ class Aligner:
 
     def __init__(
         self,
-        strategy: str | AlignmentStrategy = AlignmentStrategy.HYBRID,
+        audio_path: str,
+        strategy: str | AlignmentStrategy = AlignmentStrategy.AUTO,
         quality_threshold: float = 0.85,
         fix_drift: bool = True,
         fix_overlaps: bool = True,
+        min_gap: float = 0.3,
+        energy_snap: bool = True,
     ):
         """
         Initialize the Aligner.
 
         Args:
-            strategy: Alignment strategy ("greedy", "dp", or "hybrid")
+            audio_path: Path to the audio file being aligned
+            strategy: Alignment strategy ("greedy", "dp", "hybrid", or "auto")
             quality_threshold: Similarity threshold for quality checks (0.0-1.0)
             fix_drift: Run zone realignment to fix timing drift in long surahs
             fix_overlaps: Fix any overlapping ayah timings
+            min_gap: Minimum gap in seconds between consecutive ayahs (default 0.3)
+            energy_snap: Snap boundaries to energy minima for precise timing (default True)
         """
         if isinstance(strategy, str):
             strategy = AlignmentStrategy(strategy.lower())
@@ -68,6 +75,9 @@ class Aligner:
         self.quality_threshold = quality_threshold
         self.fix_drift = fix_drift
         self.fix_overlaps = fix_overlaps
+        self.min_gap = min_gap
+        self.energy_snap = energy_snap
+        self.audio_path = audio_path
 
         # Stats from last alignment (only populated for hybrid strategy)
         self._last_stats: HybridStats | None = None
@@ -76,6 +86,15 @@ class Aligner:
     def last_stats(self) -> HybridStats | None:
         """Get stats from the last hybrid alignment, or None if not applicable."""
         return self._last_stats
+
+    def _select_strategy(self, ayahs: list[Ayah]) -> AlignmentStrategy:
+        """Pick the best concrete strategy.
+
+        HYBRID is best or tied-for-best across all surah sizes (short,
+        medium, and long) and is the least dependent on post-processing
+        drift correction.
+        """
+        return AlignmentStrategy.HYBRID
 
     def align(
         self,
@@ -105,10 +124,15 @@ class Aligner:
         # Clear previous stats
         self._last_stats = None
 
+        # Resolve AUTO to a concrete strategy
+        strategy = self.strategy
+        if strategy == AlignmentStrategy.AUTO:
+            strategy = self._select_strategy(ayahs)
+
         # Run alignment based on strategy
-        if self.strategy == AlignmentStrategy.GREEDY:
+        if strategy == AlignmentStrategy.GREEDY:
             results = self._align_greedy(segments, ayahs, silences_ms)
-        elif self.strategy == AlignmentStrategy.DP:
+        elif strategy == AlignmentStrategy.DP:
             results = self._align_dp(segments, ayahs, silences_ms, on_progress)
         else:  # HYBRID
             results = self._align_hybrid(segments, ayahs, silences_ms, on_progress)
@@ -116,6 +140,14 @@ class Aligner:
         # Post-processing
         if self.fix_drift and results:
             results = self._apply_drift_fix(results, segments, ayahs)
+
+        # Snap boundaries to energy minima for precise timing
+        if self.energy_snap and self.audio_path and results:
+            self._apply_energy_snap(results)
+
+        # Snap ayah boundaries to actual silence periods (fixes timestamp drift)
+        if silences_ms and results:
+            self._snap_to_silences(results, silences_ms)
 
         if self.fix_overlaps and results:
             self._apply_overlap_fix(results)
@@ -181,19 +213,23 @@ class Aligner:
         ayahs: list[Ayah],
     ) -> list[AlignmentResult]:
         """Apply zone realignment to fix timing drift."""
-        from .zone_realigner import realign_problem_zones, realign_from_anchors
+        from .zone_realigner import (
+            iterative_realign_problem_zones,
+            realign_from_anchors,
+            realign_drift_zones_word_dp,
+        )
 
-        # First pass: realign problem zones
-        results, _ = realign_problem_zones(
+        # First pass: iterative zone realignment with adaptive thresholds
+        results, _ = iterative_realign_problem_zones(
             results=results,
             segments=segments,
             ayahs=ayahs,
-            min_consecutive=3,
-            quality_threshold=self.quality_threshold,
+            passes=3,
+            initial_threshold=self.quality_threshold,
             buffer_seconds=10.0,
         )
 
-        # Second pass: anchor-based realignment
+        # Second pass: anchor-based realignment with confidence weighting
         results, _ = realign_from_anchors(
             results=results,
             segments=segments,
@@ -202,38 +238,71 @@ class Aligner:
             buffer_seconds=5.0,
         )
 
+        # Third pass: zone-level word-DP fallback for drifted pace regions.
+        results, _ = realign_drift_zones_word_dp(
+            results=results,
+            segments=segments,
+            ayahs=ayahs,
+            min_consecutive=4,
+            max_pace_ratio=2.5,
+        )
+
         return results
 
+    def _apply_energy_snap(self, results: list[AlignmentResult]) -> int:
+        """Snap boundaries to local energy minima for precise timing."""
+        from .zone_realigner import snap_boundaries_to_energy
+        from ..transcription.silence import compute_energy_envelope
+
+        try:
+            envelope = compute_energy_envelope(self.audio_path)
+        except Exception:
+            return 0
+
+        return snap_boundaries_to_energy(results, envelope, max_snap_distance=1.0)
+
+    def _snap_to_silences(
+        self,
+        results: list[AlignmentResult],
+        silences_ms: list[tuple[int, int]],
+    ) -> int:
+        """Snap ayah boundaries to actual silence periods to fix drift."""
+        from .zone_realigner import snap_boundaries_to_silences
+
+        return snap_boundaries_to_silences(results, silences_ms)
+
     def _apply_overlap_fix(self, results: list[AlignmentResult]) -> int:
-        """Fix overlapping ayah timings in-place."""
+        """Fix overlapping ayah timings and ensure minimum gaps in-place."""
         from .zone_realigner import fix_overlaps
 
-        return fix_overlaps(results)
+        return fix_overlaps(results, min_gap=self.min_gap)
 
 
 # Convenience function for simple usage
 def align(
+    audio_path: str,
     segments: list[Segment],
     ayahs: list[Ayah],
     silences_ms: list[tuple[int, int]] | None = None,
-    strategy: str = "hybrid",
+    strategy: str = "auto",
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[AlignmentResult]:
     """
     Convenience function for alignment with default settings.
 
     This is equivalent to:
-        Aligner(strategy=strategy).align(segments, ayahs, silences_ms)
+        Aligner(audio_path).align(segments, ayahs, silences_ms)
 
     Args:
+        audio_path: Path to the audio file being aligned
         segments: List of transcribed Segment objects
         ayahs: List of reference Ayah objects
         silences_ms: Optional silence periods in milliseconds
-        strategy: Alignment strategy ("greedy", "dp", or "hybrid")
+        strategy: Alignment strategy ("greedy", "dp", "hybrid", or "auto")
         on_progress: Optional progress callback
 
     Returns:
         List of AlignmentResult objects
     """
-    aligner = Aligner(strategy=strategy)
+    aligner = Aligner(audio_path=audio_path, strategy=strategy)
     return aligner.align(segments, ayahs, silences_ms, on_progress)

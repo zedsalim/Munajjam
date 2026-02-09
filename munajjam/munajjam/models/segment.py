@@ -8,6 +8,14 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
 
+class WordTimestamp(BaseModel):
+    """Per-word timestamp from CTC/attention-based decoding (e.g. faster-whisper)."""
+    word: str
+    start: float
+    end: float
+    probability: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
 class SegmentType(str, Enum):
     """Type of audio segment."""
 
@@ -66,6 +74,10 @@ class Segment(BaseModel):
         description="Confidence score from transcription (0.0-1.0)",
         ge=0.0,
         le=1.0,
+    )
+    words: list[WordTimestamp] | None = Field(
+        default=None,
+        description="Per-word timestamps from CTC/attention decoding",
     )
 
     @field_validator("end")

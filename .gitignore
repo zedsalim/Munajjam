@@ -124,3 +124,7 @@ cache/
 *.csv
 batch_process.py
 *.mp3
+
+# Local-only directories (not part of the library)
+v2/
+scripts/

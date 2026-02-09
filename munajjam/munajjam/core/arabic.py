@@ -54,7 +54,14 @@ def normalize_arabic(text: str) -> str:
     # Normalize ta marbuta to ha
     text = re.sub(r"ة", "ه", text)
 
-    # Remove punctuation and diacritics (keeping letters and spaces)
+    # Normalize hamza carriers: ؤ → و, ئ → ي
+    text = re.sub(r"ؤ", "و", text)
+    text = re.sub(r"ئ", "ي", text)
+
+    # Remove Arabic diacritics (tashkeel): U+064B-U+065F, U+0670
+    text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
+
+    # Remove punctuation (keeping letters and spaces)
     text = re.sub(r"[^\w\s]", "", text)
 
     # Collapse multiple spaces and strip

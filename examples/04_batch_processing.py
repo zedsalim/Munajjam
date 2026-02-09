@@ -16,7 +16,7 @@ import json
 import time
 
 
-def process_surah(transcriber, aligner, audio_path, surah_number):
+def process_surah(transcriber, audio_path, surah_number):
     """Process a single surah and return results with stats."""
     print(f"\nProcessing Surah {surah_number}...")
 
@@ -28,7 +28,8 @@ def process_surah(transcriber, aligner, audio_path, surah_number):
     # Load ayahs
     ayahs = load_surah_ayahs(surah_number)
 
-    # Align
+    # Align (audio_path is required, full pipeline runs by default)
+    aligner = Aligner(audio_path=str(audio_path))
     results = aligner.align(segments, ayahs)
 
     elapsed = time.time() - start_time
@@ -78,13 +79,6 @@ def main():
     transcriber = WhisperTranscriber()
     transcriber.load()
 
-    aligner = Aligner(
-        strategy="hybrid",
-        quality_threshold=0.85,
-        fix_drift=True,
-        fix_overlaps=True
-    )
-
     print("  ✓ Models loaded")
 
     # Process each surah
@@ -108,7 +102,6 @@ def main():
             # Process surah
             results, stats = process_surah(
                 transcriber,
-                aligner,
                 audio_file,
                 surah_number
             )

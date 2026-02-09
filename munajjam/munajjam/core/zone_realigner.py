@@ -36,6 +36,8 @@ TWO STRATEGIES:
 from dataclasses import dataclass
 from munajjam.models import Segment, Ayah, AlignmentResult
 from .dp_core import align_segments_dp
+from .arabic import normalize_arabic
+from .matcher import similarity as _similarity
 
 
 @dataclass
@@ -60,10 +62,29 @@ class ProblemZone:
     end_time: float
 
 
+def adaptive_quality_threshold(ayah_text: str, base_threshold: float = 0.85) -> float:
+    """Return a length-adaptive quality threshold for an ayah.
+
+    Short ayahs are inherently harder to match with high similarity,
+    so we relax the threshold proportionally.
+
+    - < 5 words  → 0.60
+    - 5-15 words → 0.75
+    - > 15 words → base_threshold (default 0.85)
+    """
+    word_count = len(normalize_arabic(ayah_text).split())
+    if word_count < 5:
+        return 0.60
+    elif word_count <= 15:
+        return 0.75
+    return base_threshold
+
+
 def identify_problem_zones(
     results: list[AlignmentResult],
     min_consecutive: int = 3,
     quality_threshold: float = 0.85,
+    adaptive: bool = False,
 ) -> list[ProblemZone]:
     """
     Find sequences of consecutive low-confidence ayahs (drift zones).
@@ -102,7 +123,11 @@ def identify_problem_zones(
     current_zone_sims = []     # Similarity scores in current zone
 
     for i, result in enumerate(results):
-        is_low = result.similarity_score < quality_threshold
+        if adaptive:
+            thresh = adaptive_quality_threshold(result.ayah.text, quality_threshold)
+        else:
+            thresh = quality_threshold
+        is_low = result.similarity_score < thresh
 
         if is_low:
             # This ayah is low-confidence
@@ -204,6 +229,7 @@ def realign_problem_zones(
     min_consecutive: int = 3,
     quality_threshold: float = 0.85,
     buffer_seconds: float = 10.0,
+    adaptive: bool = False,
 ) -> tuple[list[AlignmentResult], ZoneStats]:
     """
     Re-align problem zones in the results to fix timing drift.
@@ -250,7 +276,7 @@ def realign_problem_zones(
     # STEP 1: Identify Problem Zones
     # ============================================================================
     # Scan through all results to find consecutive low-confidence ayahs
-    zones = identify_problem_zones(results, min_consecutive, quality_threshold)
+    zones = identify_problem_zones(results, min_consecutive, quality_threshold, adaptive=adaptive)
     stats.zones_found = len(zones)
 
     # If no problem zones, return original results unchanged
@@ -326,11 +352,72 @@ def realign_problem_zones(
     return new_results, stats
 
 
+def iterative_realign_problem_zones(
+    results: list[AlignmentResult],
+    segments: list[Segment],
+    ayahs: list[Ayah],
+    passes: int = 3,
+    initial_threshold: float = 0.85,
+    buffer_seconds: float = 10.0,
+) -> tuple[list[AlignmentResult], ZoneStats]:
+    """
+    Run multiple passes of zone realignment with decreasing thresholds.
+
+    Each pass fixes the worst zones, improving context for the next pass.
+    Uses adaptive thresholds so short ayahs aren't penalised.
+
+    Args:
+        results: Initial alignment results
+        segments: All transcribed segments
+        ayahs: All reference ayahs
+        passes: Number of realignment passes (default 3)
+        initial_threshold: Starting quality threshold (default 0.85)
+        buffer_seconds: Extra time at zone boundaries
+
+    Returns:
+        Tuple of (updated results, cumulative stats)
+    """
+    cumulative = ZoneStats()
+    current = list(results)
+
+    for pass_idx in range(passes):
+        # First pass: use original threshold with adaptive; later passes
+        # lower the threshold but require more consecutive bad ayahs to avoid
+        # touching areas that are already acceptable.
+        if pass_idx == 0:
+            thresh = initial_threshold
+            min_consec = 3
+        else:
+            thresh = max(0.5, initial_threshold - pass_idx * 0.1)
+            min_consec = max(3, 4 + pass_idx)  # 5, 6 — very conservative
+
+        current, stats = realign_problem_zones(
+            results=current,
+            segments=segments,
+            ayahs=ayahs,
+            min_consecutive=min_consec,
+            quality_threshold=thresh,
+            buffer_seconds=buffer_seconds,
+            adaptive=True,
+        )
+        cumulative.zones_found += stats.zones_found
+        cumulative.zones_improved += stats.zones_improved
+        cumulative.ayahs_improved += stats.ayahs_improved
+        cumulative.ayahs_unchanged += stats.ayahs_unchanged
+        cumulative.ayahs_degraded += stats.ayahs_degraded
+
+        if stats.zones_found == 0:
+            break  # No more problem zones
+
+    return current, cumulative
+
+
 def find_anchors(
     results: list[AlignmentResult],
     min_similarity: float = 0.95,
     min_wps: float = 0.8,
     max_wps: float = 2.0,
+    confidence_weighted: bool = True,
 ) -> list[tuple[int, AlignmentResult]]:
     """
     Find anchor points - high-confidence ayahs with normal recitation pace.
@@ -338,17 +425,15 @@ def find_anchors(
     Anchors are ayahs we're very confident about. We use them as reference
     points and re-align the regions between them.
 
-    What makes a good anchor?
-    1. High similarity (≥95%) - we're confident the timing is correct
-    2. Normal WPS (words per second) - not too fast or too slow
-       - Too fast (>2 WPS): might be compressed/rushed
-       - Too slow (<0.8 WPS): might have pauses or timing issues
+    When confidence_weighted is True, also considers timestamp consistency
+    with neighbors as part of the anchor quality score.
 
     Args:
         results: List of alignment results
         min_similarity: Minimum similarity to be an anchor (default 0.95)
         min_wps: Minimum words per second (default 0.8)
         max_wps: Maximum words per second (default 2.0)
+        confidence_weighted: Also check neighbor timestamp consistency
 
     Returns:
         List of (index, result) tuples for anchor points
@@ -358,10 +443,30 @@ def find_anchors(
         words = len(r.ayah.text.split())
         duration = r.end_time - r.start_time
         wps = words / duration if duration > 0 else 0
-        
-        if r.similarity_score >= min_similarity and min_wps <= wps <= max_wps:
-            anchors.append((i, r))
-    
+
+        if r.similarity_score < min_similarity or not (min_wps <= wps <= max_wps):
+            continue
+
+        if confidence_weighted and len(results) > 2:
+            # Check that neighbors also have reasonable similarity
+            neighbor_ok = True
+            for ni in (i - 1, i + 1):
+                if 0 <= ni < len(results):
+                    if results[ni].similarity_score < 0.5:
+                        neighbor_ok = False
+                        break
+                    # Check for timestamp ordering consistency
+                    if ni == i - 1 and results[ni].end_time > r.start_time + 1.0:
+                        neighbor_ok = False
+                        break
+                    if ni == i + 1 and results[ni].start_time < r.end_time - 1.0:
+                        neighbor_ok = False
+                        break
+            if not neighbor_ok:
+                continue
+
+        anchors.append((i, r))
+
     return anchors
 
 
@@ -503,11 +608,16 @@ def realign_from_anchors(
     return new_results, stats
 
 
-def fix_overlaps(results: list[AlignmentResult]) -> int:
+def fix_overlaps(results: list[AlignmentResult], min_gap: float = 0.0) -> int:
     """
     Fix any overlapping ayah timings by adjusting boundaries.
     
-    Returns number of overlaps fixed.
+    Args:
+        results: List of alignment results to fix in-place
+        min_gap: Minimum gap in seconds between consecutive ayahs (default 0.0)
+    
+    Returns:
+        Number of overlaps/zero-gaps fixed.
     """
     if len(results) < 2:
         return 0
@@ -520,22 +630,37 @@ def fix_overlaps(results: list[AlignmentResult]) -> int:
         prev = results[i-1]
         curr = results[i]
         
-        if curr.start_time < prev.end_time:
-            # Fix by meeting at midpoint
-            midpoint = (prev.end_time + curr.start_time) / 2
+        actual_gap = curr.start_time - prev.end_time
+        
+        # Fix if there's an overlap OR if gap is less than minimum
+        if actual_gap < min_gap:
+            # Calculate how much adjustment is needed
+            gap_needed = min_gap - actual_gap
+            
+            # Split the adjustment: take half from previous end, add half to current start
+            half_adjust = gap_needed / 2
+            
+            new_prev_end = prev.end_time - half_adjust
+            new_curr_start = curr.start_time + half_adjust
+            
+            # Ensure we don't create invalid timings
+            if new_prev_end < prev.start_time:
+                new_prev_end = prev.start_time + 0.1
+            if new_curr_start > curr.end_time:
+                new_curr_start = curr.end_time - 0.1
             
             # Update timing (create new results since AlignmentResult might be immutable)
             results[i-1] = AlignmentResult(
                 ayah=prev.ayah,
                 start_time=prev.start_time,
-                end_time=round(midpoint - 0.05, 2),
+                end_time=round(new_prev_end, 2),
                 transcribed_text=prev.transcribed_text,
                 similarity_score=prev.similarity_score,
                 overlap_detected=prev.overlap_detected,
             )
             results[i] = AlignmentResult(
                 ayah=curr.ayah,
-                start_time=round(midpoint + 0.05, 2),
+                start_time=round(new_curr_start, 2),
                 end_time=curr.end_time,
                 transcribed_text=curr.transcribed_text,
                 similarity_score=curr.similarity_score,
@@ -546,13 +671,505 @@ def fix_overlaps(results: list[AlignmentResult]) -> int:
     return fixes
 
 
+def snap_boundaries_to_silences(
+    results: list[AlignmentResult],
+    silences_ms: list[tuple[int, int]] | None,
+    max_snap_distance: float = 2.0,
+) -> int:
+    """
+    Snap ayah start/end boundaries to nearest silence periods.
+    
+    This fixes timestamp drift by aligning ayah boundaries to actual
+    pauses in the audio rather than relying on potentially drifted
+    segment timestamps.
+    
+    Args:
+        results: List of alignment results to fix in-place
+        silences_ms: Silence periods in milliseconds [(start_ms, end_ms), ...]
+        max_snap_distance: Maximum distance in seconds to snap (default 2.0)
+    
+    Returns:
+        Number of boundaries snapped.
+    """
+    if not silences_ms or len(results) < 2:
+        return 0
+    
+    # Convert silences to seconds and create lookup structure
+    silences_sec = [(s / 1000.0, e / 1000.0) for s, e in silences_ms]
+    silences_sec.sort(key=lambda x: x[0])
+    
+    # Create list of silence midpoints (natural ayah boundary points)
+    silence_midpoints = [(s + e) / 2 for s, e in silences_sec]
+    
+    # Sort results by ayah number
+    results.sort(key=lambda r: r.ayah.ayah_number)
+    
+    snaps = 0
+    
+    # For each ayah boundary (except first start and last end),
+    # find the nearest silence and snap to it
+    for i in range(len(results) - 1):
+        curr = results[i]
+        next_r = results[i + 1]
+        
+        # Current boundary is at curr.end_time / next_r.start_time
+        boundary_time = (curr.end_time + next_r.start_time) / 2
+        
+        # Find nearest silence midpoint
+        best_silence_mid = None
+        best_distance = float('inf')
+        
+        for sil_start, sil_end in silences_sec:
+            sil_mid = (sil_start + sil_end) / 2
+            distance = abs(sil_mid - boundary_time)
+            
+            if distance < best_distance and distance <= max_snap_distance:
+                best_distance = distance
+                best_silence_mid = sil_mid
+                best_silence = (sil_start, sil_end)
+        
+        if best_silence_mid is not None:
+            # Snap curr.end to silence start, next.start to silence end
+            sil_start, sil_end = best_silence
+            
+            # Only snap if it doesn't create invalid timings
+            if sil_start > curr.start_time and sil_end < next_r.end_time:
+                # Update curr to end at silence start
+                results[i] = AlignmentResult(
+                    ayah=curr.ayah,
+                    start_time=curr.start_time,
+                    end_time=round(sil_start, 2),
+                    transcribed_text=curr.transcribed_text,
+                    similarity_score=curr.similarity_score,
+                    overlap_detected=curr.overlap_detected,
+                )
+                
+                # Update next to start at silence end
+                results[i + 1] = AlignmentResult(
+                    ayah=next_r.ayah,
+                    start_time=round(sil_end, 2),
+                    end_time=next_r.end_time,
+                    transcribed_text=next_r.transcribed_text,
+                    similarity_score=next_r.similarity_score,
+                    overlap_detected=next_r.overlap_detected,
+                )
+                
+                snaps += 1
+    
+    return snaps
+
+
+def snap_boundaries_to_energy(
+    results: list[AlignmentResult],
+    energy_envelope: list[tuple[float, float]],
+    max_snap_distance: float = 1.0,
+) -> int:
+    """
+    Snap ayah boundaries to local energy minima for precise timing.
+
+    Uses the RMS energy envelope to find the lowest-energy point near
+    each boundary, which typically corresponds to a brief pause between
+    ayahs.
+
+    Args:
+        results: List of alignment results to fix in-place
+        energy_envelope: Output of compute_energy_envelope()
+        max_snap_distance: Maximum distance in seconds to snap (default 1.0)
+
+    Returns:
+        Number of boundaries snapped.
+    """
+    if not energy_envelope or len(results) < 2:
+        return 0
+
+    from ..transcription.silence import find_energy_minima
+
+    results.sort(key=lambda r: r.ayah.ayah_number)
+    snaps = 0
+
+    for i in range(len(results) - 1):
+        curr = results[i]
+        next_r = results[i + 1]
+
+        boundary_time = (curr.end_time + next_r.start_time) / 2
+        search_start = boundary_time - max_snap_distance
+        search_end = boundary_time + max_snap_distance
+
+        minima = find_energy_minima(
+            energy_envelope, search_start, search_end, top_n=1,
+        )
+
+        if not minima:
+            continue
+
+        snap_point = minima[0]
+
+        # Only snap if it doesn't create invalid timings
+        if snap_point > curr.start_time + 0.1 and snap_point < next_r.end_time - 0.1:
+            results[i] = AlignmentResult(
+                ayah=curr.ayah,
+                start_time=curr.start_time,
+                end_time=round(snap_point, 3),
+                transcribed_text=curr.transcribed_text,
+                similarity_score=curr.similarity_score,
+                overlap_detected=curr.overlap_detected,
+            )
+            results[i + 1] = AlignmentResult(
+                ayah=next_r.ayah,
+                start_time=round(snap_point, 3),
+                end_time=next_r.end_time,
+                transcribed_text=next_r.transcribed_text,
+                similarity_score=next_r.similarity_score,
+                overlap_detected=next_r.overlap_detected,
+            )
+            snaps += 1
+
+    return snaps
+
+
+def identify_drift_zones(
+    results: list[AlignmentResult],
+    min_consecutive: int = 5,
+    max_pace_ratio: float = 2.5,
+) -> list[ProblemZone]:
+    """
+    Find zones where timestamps drift even though similarity is high.
+
+    Traditional zone detection checks similarity, but repetitive short ayahs
+    can have high similarity at the WRONG audio position.  This function
+    checks *pace consistency*: if an ayah's duration per word is far from
+    the surah-wide median, it's likely misplaced.
+
+    Args:
+        results: Alignment results (in order)
+        min_consecutive: Minimum consecutive drifted ayahs to form a zone
+        max_pace_ratio: Flag an ayah when its pace deviates by more than
+                        this factor from the median pace
+
+    Returns:
+        List of ProblemZone objects for zones with pace drift.
+    """
+    if len(results) < min_consecutive:
+        return []
+
+    # Compute per-ayah duration-per-word (pace)
+    paces: list[float] = []
+    for r in results:
+        duration = r.end_time - r.start_time
+        n_words = max(len(normalize_arabic(r.ayah.text).split()), 1)
+        paces.append(duration / n_words if duration > 0 else 0.0)
+
+    # Median pace (robust to outliers)
+    sorted_paces = sorted(p for p in paces if p > 0)
+    if not sorted_paces:
+        return []
+    median_pace = sorted_paces[len(sorted_paces) // 2]
+
+    if median_pace <= 0:
+        return []
+
+    # Flag ayahs with abnormal pace
+    is_drifted = []
+    for p in paces:
+        if p <= 0:
+            is_drifted.append(True)
+        else:
+            ratio = max(p / median_pace, median_pace / p)
+            is_drifted.append(ratio > max_pace_ratio)
+
+    # Find consecutive runs
+    zones: list[ProblemZone] = []
+    run_start = None
+
+    for i, drifted in enumerate(is_drifted):
+        if drifted:
+            if run_start is None:
+                run_start = i
+        else:
+            if run_start is not None and (i - run_start) >= min_consecutive:
+                zone_results = results[run_start:i]
+                avg_sim = sum(r.similarity_score for r in zone_results) / len(zone_results)
+                zones.append(ProblemZone(
+                    start_idx=run_start,
+                    end_idx=i,
+                    start_ayah=zone_results[0].ayah.ayah_number,
+                    end_ayah=zone_results[-1].ayah.ayah_number,
+                    avg_similarity=avg_sim,
+                    start_time=zone_results[0].start_time,
+                    end_time=zone_results[-1].end_time,
+                ))
+            run_start = None
+
+    # Trailing zone
+    if run_start is not None and (len(results) - run_start) >= min_consecutive:
+        zone_results = results[run_start:]
+        avg_sim = sum(r.similarity_score for r in zone_results) / len(zone_results)
+        zones.append(ProblemZone(
+            start_idx=run_start,
+            end_idx=len(results),
+            start_ayah=zone_results[0].ayah.ayah_number,
+            end_ayah=zone_results[-1].ayah.ayah_number,
+            avg_similarity=avg_sim,
+            start_time=zone_results[0].start_time,
+            end_time=zone_results[-1].end_time,
+        ))
+
+    return zones
+
+
+def _find_problem_runs(
+    results: list[AlignmentResult],
+    similarity_threshold: float = 0.75,
+    min_consecutive: int = 2,
+    max_pace_ratio: float = 2.5,
+) -> list[tuple[int, int]]:
+    """
+    Find consecutive ayah runs that are low-confidence or pace-abnormal.
+
+    Returns:
+        List of (start_idx, end_idx) runs where end_idx is exclusive.
+    """
+    if len(results) < min_consecutive:
+        return []
+
+    # Per-ayah pace: seconds per word
+    paces: list[float] = []
+    for r in results:
+        duration = r.end_time - r.start_time
+        words = max(len(normalize_arabic(r.ayah.text).split()), 1)
+        paces.append(duration / words if duration > 0 else 0.0)
+
+    valid_paces = sorted(p for p in paces if p > 0)
+    median_pace = valid_paces[len(valid_paces) // 2] if valid_paces else 0.0
+
+    is_problem: list[bool] = []
+    for i, r in enumerate(results):
+        low_similarity = r.similarity_score < similarity_threshold
+        pace = paces[i]
+
+        pace_outlier = False
+        if median_pace > 0 and pace > 0:
+            ratio = max(pace / median_pace, median_pace / pace)
+            pace_outlier = ratio > max_pace_ratio
+
+        is_problem.append(low_similarity or pace_outlier)
+
+    runs: list[tuple[int, int]] = []
+    run_start = None
+
+    for i, flag in enumerate(is_problem):
+        if flag:
+            if run_start is None:
+                run_start = i
+        elif run_start is not None:
+            if i - run_start >= min_consecutive:
+                runs.append((run_start, i))
+            run_start = None
+
+    if run_start is not None and (len(results) - run_start) >= min_consecutive:
+        runs.append((run_start, len(results)))
+
+    return runs
+
+
+def realign_drift_zones_word_dp(
+    results: list[AlignmentResult],
+    segments: list[Segment],
+    ayahs: list[Ayah],
+    min_consecutive: int = 5,
+    max_pace_ratio: float = 2.5,
+) -> tuple[list[AlignmentResult], ZoneStats]:
+    """
+    Detect and re-align zones with timestamp drift using word-level DP.
+
+    Unlike similarity-based zone realignment, this detects drift via pace
+    analysis and re-runs word-DP on the zone with CORRECT time bounds
+    derived from surrounding anchors.
+
+    Args:
+        results: Initial alignment results
+        segments: All transcribed segments
+        ayahs: All reference ayahs
+        min_consecutive: Min consecutive drifted ayahs to form a zone
+        max_pace_ratio: Pace deviation threshold
+
+    Returns:
+        Tuple of (updated results, statistics)
+    """
+    from .word_level_dp import (
+        build_word_stream, build_reference_words, align_words_dp,
+    )
+    from .matcher import similarity as _sim
+
+    stats = ZoneStats()
+    drift_zones = identify_drift_zones(results, min_consecutive, max_pace_ratio)
+    stats.zones_found = len(drift_zones)
+
+    if not drift_zones:
+        return results, stats
+
+    new_results = list(results)
+    ayah_by_num = {a.ayah_number: a for a in ayahs}
+
+    # Build full word stream once
+    from .dp_core import _filter_special_segments
+    filtered = _filter_special_segments(segments, ayahs)
+    all_words = build_word_stream(filtered)
+    all_ref_words = build_reference_words(ayahs)
+
+    if not all_words:
+        return results, stats
+
+    for zone in drift_zones:
+        # Find anchor times from surrounding well-placed ayahs.
+        # Look for the last non-drifted ayah before the zone and the
+        # first non-drifted ayah after.
+        anchor_start_time = 0.0
+        anchor_end_time = all_words[-1].estimated_end
+
+        # Search backwards from zone start for a reliable anchor
+        for i in range(zone.start_idx - 1, -1, -1):
+            r = new_results[i]
+            dur = r.end_time - r.start_time
+            n_w = max(len(normalize_arabic(r.ayah.text).split()), 1)
+            if dur > 0 and r.similarity_score >= 0.7:
+                anchor_start_time = r.end_time
+                break
+
+        # Search forwards from zone end for a reliable anchor
+        for i in range(zone.end_idx, len(new_results)):
+            r = new_results[i]
+            dur = r.end_time - r.start_time
+            n_w = max(len(normalize_arabic(r.ayah.text).split()), 1)
+            if dur > 0 and r.similarity_score >= 0.7:
+                anchor_end_time = r.start_time
+                break
+
+        # Generous buffer
+        buffer = 5.0
+        t_lo = max(0.0, anchor_start_time - buffer)
+        t_hi = anchor_end_time + buffer
+
+        # Extract words within the anchor time bounds
+        zone_word_indices = [
+            i for i, w in enumerate(all_words)
+            if w.estimated_start >= t_lo and w.estimated_end <= t_hi
+        ]
+
+        if not zone_word_indices:
+            continue
+
+        w_lo = zone_word_indices[0]
+        w_hi = zone_word_indices[-1] + 1
+        zone_words = all_words[w_lo:w_hi]
+
+        # Extract ayahs for this zone
+        zone_ayah_nums = list(range(zone.start_ayah, zone.end_ayah + 1))
+        zone_ayahs = [ayah_by_num[n] for n in zone_ayah_nums if n in ayah_by_num]
+        zone_ayah_indices = [n - 1 for n in zone_ayah_nums if n in ayah_by_num]
+        zone_ref_words = [all_ref_words[i] for i in zone_ayah_indices]
+
+        if not zone_ayahs or not zone_words:
+            continue
+
+        # Run word-DP on just this zone
+        assignments = align_words_dp(
+            zone_words, zone_ayahs, zone_ref_words,
+            max_word_ratio=3.0, beam_width=80,
+        )
+
+        if not assignments:
+            continue
+
+        # Convert assignments to results and compare
+        zone_improved = False
+        new_by_ayah: dict[int, AlignmentResult] = {}
+
+        for word_start, word_end, ayah_idx in assignments:
+            ayah = zone_ayahs[ayah_idx]
+            start_time = zone_words[word_start].estimated_start
+            end_time = zone_words[word_end - 1].estimated_end
+            transcribed = " ".join(w.text for w in zone_words[word_start:word_end])
+            sim = _sim(transcribed, ayah.text)
+
+            new_by_ayah[ayah.ayah_number] = AlignmentResult(
+                ayah=ayah,
+                start_time=round(start_time, 3),
+                end_time=round(end_time, 3),
+                transcribed_text=transcribed,
+                similarity_score=round(sim, 4),
+                overlap_detected=False,
+            )
+
+        # Replace results for zone ayahs — accept if overall zone improves.
+        # For drift zones, we check BOTH similarity and pace consistency.
+        # A result with slightly lower sim but much better pace is preferred.
+        sorted_paces = []
+        for r in new_results:
+            dur = r.end_time - r.start_time
+            nw = max(len(normalize_arabic(r.ayah.text).split()), 1)
+            if dur > 0:
+                sorted_paces.append(dur / nw)
+        sorted_paces.sort()
+        median_pace = sorted_paces[len(sorted_paces) // 2] if sorted_paces else 1.0
+
+        for i in range(zone.start_idx, min(zone.end_idx, len(new_results))):
+            old_r = new_results[i]
+            anum = old_r.ayah.ayah_number
+            if anum not in new_by_ayah:
+                continue
+
+            new_r = new_by_ayah[anum]
+
+            # Compute pace quality for old and new
+            old_dur = old_r.end_time - old_r.start_time
+            new_dur = new_r.end_time - new_r.start_time
+            n_w = max(len(normalize_arabic(old_r.ayah.text).split()), 1)
+
+            old_pace = old_dur / n_w if old_dur > 0 else 0
+            new_pace = new_dur / n_w if new_dur > 0 else 0
+
+            old_pace_dev = abs(old_pace - median_pace) / median_pace if median_pace > 0 else 999
+            new_pace_dev = abs(new_pace - median_pace) / median_pace if median_pace > 0 else 999
+
+            # Accept new result if:
+            # 1. Similarity is at least 90% of old, AND
+            # 2. Pace is significantly closer to median
+            sim_ok = new_r.similarity_score >= old_r.similarity_score * 0.9
+            pace_improved = new_pace_dev < old_pace_dev * 0.8
+
+            if sim_ok and pace_improved:
+                new_results[i] = new_r
+                stats.ayahs_improved += 1
+                zone_improved = True
+            elif new_r.similarity_score > old_r.similarity_score + 0.02:
+                new_results[i] = new_r
+                stats.ayahs_improved += 1
+                zone_improved = True
+            else:
+                stats.ayahs_unchanged += 1
+
+        if zone_improved:
+            stats.zones_improved += 1
+
+    return new_results, stats
+
+
+
+
 # Export for use in other modules
 __all__ = [
     'realign_problem_zones',
+    'iterative_realign_problem_zones',
     'identify_problem_zones',
+    'identify_drift_zones',
+    'realign_drift_zones_word_dp',
+    'adaptive_quality_threshold',
     'realign_from_anchors',
     'find_anchors',
     'fix_overlaps',
+    'snap_boundaries_to_silences',
+    'snap_boundaries_to_energy',
     'ProblemZone',
     'ZoneStats',
 ]

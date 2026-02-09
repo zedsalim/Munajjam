@@ -3,9 +3,11 @@ Similarity matching algorithms for Arabic text.
 
 This module provides functions for computing similarity between
 transcribed audio text and reference Quran text.
+
+Uses SIMD-accelerated rapidfuzz for fast string matching.
 """
 
-from difflib import SequenceMatcher
+from rapidfuzz.distance import Indel as _rapidfuzz_indel
 
 from munajjam.core.arabic import normalize_arabic
 
@@ -14,8 +16,9 @@ def similarity(text1: str, text2: str, normalize: bool = True) -> float:
     """
     Compute similarity ratio between two strings.
 
-    Uses SequenceMatcher to compute a ratio between 0.0 (no similarity)
-    and 1.0 (identical strings).
+    Returns a ratio between 0.0 (no similarity) and 1.0 (identical strings).
+
+    Uses SIMD-accelerated rapidfuzz for fast matching.
 
     Args:
         text1: First string to compare
@@ -35,7 +38,7 @@ def similarity(text1: str, text2: str, normalize: bool = True) -> float:
         text1 = normalize_arabic(text1)
         text2 = normalize_arabic(text2)
 
-    return SequenceMatcher(None, text1, text2).ratio()
+    return _rapidfuzz_indel.normalized_similarity(text1, text2)
 
 
 def get_first_words(text: str, n: int = 1, normalize: bool = True) -> str:

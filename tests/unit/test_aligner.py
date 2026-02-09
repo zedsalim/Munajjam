@@ -5,25 +5,43 @@ Unit tests for alignment strategies.
 import pytest
 from munajjam.core import Aligner, align
 
+# Tests use synthetic data — no real audio file, so disable acoustic features.
+DUMMY_AUDIO = "test.wav"
+
 
 class TestAligner:
     """Test Aligner class and strategies."""
 
-    @pytest.mark.parametrize("strategy", ["greedy", "dp", "hybrid"])
+    @pytest.mark.parametrize("strategy", ["greedy", "dp", "hybrid", "auto"])
     def test_aligner_initialization(self, strategy):
         """Test Aligner can be initialized with each strategy."""
-        aligner = Aligner(strategy=strategy)
+        aligner = Aligner(DUMMY_AUDIO, strategy=strategy, energy_snap=False)
         assert aligner.strategy.value == strategy
 
     def test_aligner_invalid_strategy(self):
         """Test that invalid strategy raises error."""
         with pytest.raises(ValueError):
-            Aligner(strategy="invalid")
+            Aligner(DUMMY_AUDIO, strategy="invalid")
 
-    @pytest.mark.parametrize("strategy", ["greedy", "dp", "hybrid"])
+    def test_aligner_defaults(self):
+        """Test that audio_path is required and energy_snap defaults to True."""
+        aligner = Aligner("/tmp/test.mp3")
+        assert aligner.audio_path == "/tmp/test.mp3"
+        assert aligner.energy_snap is True
+        assert aligner.strategy.value == "auto"
+
+    def test_auto_strategy_selection(self, sample_segments, sample_ayahs):
+        """Test that strategy='auto' works and returns results."""
+        aligner = Aligner(DUMMY_AUDIO, strategy="auto", energy_snap=False)
+        results = aligner.align(sample_segments, sample_ayahs)
+
+        assert isinstance(results, list)
+        assert len(results) > 0
+
+    @pytest.mark.parametrize("strategy", ["greedy", "dp", "hybrid", "auto"])
     def test_align_returns_results(self, strategy, sample_segments, sample_ayahs):
         """Test alignment returns results with correct structure."""
-        aligner = Aligner(strategy=strategy)
+        aligner = Aligner(DUMMY_AUDIO, strategy=strategy, energy_snap=False)
         results = aligner.align(sample_segments, sample_ayahs)
 
         assert isinstance(results, list)
@@ -39,7 +57,7 @@ class TestAligner:
 
     def test_align_with_silences(self, sample_segments, sample_ayahs, sample_silences):
         """Test alignment with silence detection."""
-        aligner = Aligner(strategy="hybrid")
+        aligner = Aligner(DUMMY_AUDIO, strategy="hybrid", energy_snap=False)
         results = aligner.align(sample_segments, sample_ayahs, silences_ms=sample_silences)
 
         assert isinstance(results, list)
@@ -52,7 +70,7 @@ class TestAligner:
         def callback(current, total):
             progress_calls.append((current, total))
 
-        aligner = Aligner(strategy="hybrid")
+        aligner = Aligner(DUMMY_AUDIO, strategy="hybrid", energy_snap=False)
         aligner.align(sample_segments, sample_ayahs, on_progress=callback)
 
         # Callback should have been called (implementation may vary)
@@ -60,7 +78,7 @@ class TestAligner:
 
     def test_high_confidence_threshold(self, sample_segments, sample_ayahs):
         """Test custom quality threshold."""
-        aligner = Aligner(strategy="hybrid", quality_threshold=0.85)
+        aligner = Aligner(DUMMY_AUDIO, strategy="hybrid", quality_threshold=0.85, energy_snap=False)
         results = aligner.align(sample_segments, sample_ayahs)
 
         for result in results:
@@ -73,7 +91,7 @@ class TestAlignFunction:
 
     def test_align_function_works(self, sample_segments, sample_ayahs):
         """Test that align() convenience function works."""
-        results = align(sample_segments, sample_ayahs)
+        results = align(DUMMY_AUDIO, sample_segments, sample_ayahs)
 
         assert isinstance(results, list)
         assert len(results) > 0
