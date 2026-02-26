@@ -1,16 +1,15 @@
 """
 Ayah (verse) data model.
 """
-
 from pydantic import BaseModel, Field
 
 
 class Ayah(BaseModel):
     """
-    Represents a single ayah (verse) from the Quran.
+    Represents a single ayah (verse) from the Quran (Warsh recitation).
 
     Attributes:
-        id: Unique identifier for the ayah (1-6236)
+        id: Unique identifier for the ayah (1-6214)
         surah_id: Surah number (1-114)
         ayah_number: Ayah number within the surah (1-based)
         text: The Arabic text of the ayah
@@ -18,7 +17,7 @@ class Ayah(BaseModel):
 
     id: int = Field(
         ...,
-        description="Unique identifier for the ayah (1-6236)",
+        description="Unique identifier for the ayah (1-6214)",
         ge=1,
     )
     surah_id: int = Field(
@@ -45,7 +44,7 @@ class Ayah(BaseModel):
                     "id": 1,
                     "surah_id": 1,
                     "ayah_number": 1,
-                    "text": "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ",
+                    "text": "اِ۬لْحَمْدُ لِلهِ رَبِّ اِ۬لْعَٰلَمِينَ",
                 }
             ]
         }
@@ -56,4 +55,3 @@ class Ayah(BaseModel):
 
     def __repr__(self) -> str:
         return f"Ayah(id={self.id}, surah_id={self.surah_id}, ayah_number={self.ayah_number})"
-
