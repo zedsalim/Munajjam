@@ -2,6 +2,8 @@
 
 **A Python library to synchronize Quran ayat with audio recitations — Warsh (6214 ayahs edition).**
 
+Munajjam-Warsh uses AI-powered speech recognition to automatically generate precise timestamps for each ayah in a Quran audio recording.
+
 This repository is a fork of [Munajjam](https://github.com/Itqan-community/munajjam) by the [ITQAN Community](https://community.itqan.dev).
 
 It has been adapted to support the **Warsh ‘an Nafi’ riwayah (6214 ayahs version)** based on the Madinah Mushaf edition published by the [King Fahd Glorious Qur'an Printing Complex](https://qurancomplex.gov.sa/quran-dev/).
@@ -51,7 +53,7 @@ Install the package:
 pip install .
 ```
 
-For faster transcription with [faster-whisper](https://github.com/SYSTRAN/faster-whisper):
+For faster transcription with faster-whisper:
 
 ```bash
 pip install ".[faster-whisper]"
@@ -91,9 +93,10 @@ with WhisperTranscriber() as transcriber:
 # Load Warsh ayahs (6214 structure)
 ayahs = load_surah_ayahs(1)
 
-# Align
+# Align to ayahs (uses auto strategy by default)
 results = align("001.mp3", segments, ayahs)
 
+# Get timestamps
 for result in results:
     print(f"Ayah {result.ayah.ayah_number}: "
           f"{result.start_time:.2f}s - {result.end_time:.2f}s")
@@ -101,15 +104,64 @@ for result in results:
 
 ---
 
+### 3. Example Output
+
+```
+Ayah 1: 5.62s - 9.57s
+Ayah 2: 10.51s - 14.72s
+Ayah 3: 15.45s - 18.53s
+Ayah 4: 19.21s - 22.54s
+Ayah 5: 23.27s - 28.19s
+Ayah 6: 29.00s - 33.07s
+Ayah 7: 33.98s - 46.44s
+```
+
+---
+
 ## Features
 
-* 🎙 Whisper Transcription (faster-whisper backend supported)
-* 🧠 AI-powered ayah alignment
-* 📖 Warsh (6214 ayahs) dataset support
-* 🔍 Multiple alignment strategies (Auto, Hybrid, DP, Greedy)
-* 🔄 Automatic drift correction
-* 📊 Quality confidence scoring
-* 🔤 Arabic text normalization (Warsh-aware)
+* **Whisper Transcription** – Uses faster-whisper as default backend with Quran-tuned models
+* **Four Alignment Strategies** – Auto, Hybrid, DP, and Greedy
+* **Arabic Text Normalization** – Handles diacritics, hamzas, and Warsh orthographic variations
+* **Automatic Drift Correction** – Multi-pass zone realignment for long recordings
+* **Quality Metrics** – Confidence scores for each aligned ayah
+* **Phonetic Similarity** – Arabic ASR confusion-aware similarity scoring
+* **Word-level Precision** – Uses per-word timestamps (when available) to improve drift recovery
+
+---
+
+## Alignment Strategies
+
+The default `auto` strategy works best for most cases. You can override it:
+
+```python
+from munajjam.core import Aligner
+
+# Auto (recommended) - picks the best strategy
+aligner = Aligner("001.mp3")
+
+# Hybrid - DP with greedy fallback
+aligner = Aligner("001.mp3", strategy="hybrid")
+
+# Greedy - fastest, good for clean recordings
+aligner = Aligner("001.mp3", strategy="greedy")
+
+# DP - optimal alignment using dynamic programming
+aligner = Aligner("001.mp3", strategy="dp")
+
+results = aligner.align(segments, ayahs)
+```
+
+---
+
+## Examples
+
+See the [examples](./examples) directory for more usage patterns:
+
+* `01_basic_usage.py` – Simple transcription and alignment
+* `02_comparing_strategies.py` – Compare alignment strategies
+* `03_advanced_configuration.py` – Custom settings and options
+* `04_batch_processing.py` – Process multiple files
 
 ---
 
@@ -117,7 +169,16 @@ for result in results:
 
 * Python 3.10+
 * PyTorch 2.0+
-* FFmpeg
+* FFmpeg (for audio processing)
+
+---
+
+## Community
+
+Original project resources:
+
+* Website: [https://munajjam.itqan.dev](https://munajjam.itqan.dev)
+* ITQAN Community: [https://community.itqan.dev](https://community.itqan.dev)
 
 ---
 
